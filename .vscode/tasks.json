@@ -1,0 +1,34 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Serve Routile",
+      "detail": "Static server on http://localhost:8000 (ES modules and the worker need HTTP, not file://)",
+      "type": "shell",
+      "command": "python",
+      "args": ["-u", "-m", "http.server", "8000", "--bind", "127.0.0.1"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "routile-serve",
+        "pattern": { "regexp": "^__never_matches__$" },
+        "background": {
+          "activeBegins": true,
+          "beginsPattern": "^Serving HTTP",
+          "endsPattern": "^Serving HTTP"
+        }
+      },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Open Routile in browser",
+      "type": "shell",
+      "command": "Start-Process http://localhost:8000",
+      "options": { "shell": { "executable": "pwsh", "args": ["-NoProfile", "-Command"] } },
+      "dependsOn": "Serve Routile",
+      "presentation": { "reveal": "never" },
+      "problemMatcher": []
+    }
+  ]
+}
