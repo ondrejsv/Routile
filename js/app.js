@@ -2328,9 +2328,14 @@ function buildLegend(sessions) {
 }
 
 /* The top bar floats centred over the map with the session list beside it, and
-   gives way in three cumulative steps as the window narrows: tools drop their
-   labels, the bar slides left out of the centre, then the panel stacks above
-   the map and hands it 388px. Nothing ever leaves the map.
+   gives way in four cumulative steps as the window narrows: tools drop their
+   labels, the bar slides left out of the centre, the session list drops below
+   the bar, then the panel stacks above the map and hands it 388px. Nothing ever
+   leaves the map.
+
+   The session list steps aside before the panel does: it shows up only once a
+   route exists, and stacking for it alone turned a wide laptop screen into the
+   phone layout the moment a route was computed.
 
    Measured, not guessed from a breakpoint: room needed depends on the labels,
    room available on whether there are sessions to list. Each step strips the
@@ -2347,7 +2352,7 @@ phoneLayout.addEventListener('change', () => layoutOverlays());
 function layoutOverlays() {
   const stage = $('stage');
   const root = document.documentElement;
-  stage.classList.remove('tools-tight', 'tools-left', 'find-above');
+  stage.classList.remove('tools-tight', 'tools-left', 'legend-below', 'find-above');
   root.classList.remove('app-stacked');
   putFinderInBar();
 
@@ -2358,6 +2363,7 @@ function layoutOverlays() {
   } else {
     if (barIsCrowded()) stage.classList.add('tools-tight');
     if (barIsCrowded()) stage.classList.add('tools-left');
+    if (barIsCrowded()) stage.classList.add('legend-below');
     if (barIsCrowded()) root.classList.add('app-stacked');
   }
 
@@ -2388,7 +2394,7 @@ function barOverflows() {
 }
 
 // Does the bar, where it currently sits, clear both stage edges and the
-// session list on its right?
+// session list on its right? Once the list sits below the bar, only the edges.
 function barIsCrowded() {
   const stage = $('stage').getBoundingClientRect();
   const bar = $('topbar').getBoundingClientRect();
@@ -2396,6 +2402,7 @@ function barIsCrowded() {
   if (bar.width > stage.width - 2 * clear) return true;
   const legend = $('legend');
   if (legend.classList.contains('hidden')) return false;
+  if ($('stage').classList.contains('legend-below')) return false;
   return bar.right + clear > legend.getBoundingClientRect().left;
 }
 

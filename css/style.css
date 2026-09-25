@@ -823,7 +823,14 @@ html, body {
    the room left is all on the left. */
 #stage.tools-left #topbar { left: 14px; transform: none; }
 
-/* Third step is .app-stacked below: the panel goes above the map and hands the
+/* Third, the sessions leave the bar's row and hang below it in the same
+   corner. The bar then has the stage's whole width. */
+#stage.legend-below .legend {
+  top: 66px;
+  max-height: calc(100% - 80px);
+}
+
+/* Fourth step is .app-stacked below: the panel goes above the map and hands the
    stage its whole 388px, nearly always more than the bar was short by. */
 
 /* --------------------------------------------------------- touch devices */
