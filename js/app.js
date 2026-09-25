@@ -5,6 +5,9 @@ import { Area } from './area.js';
 import { DetailLayer } from './detail.js';
 import { gpxZip, fileStamp } from './gpx.js';
 import { openCache } from './cache.js';
+import {
+  MAX_QUERY_RULES, MAX_RULES, TAG_FILTER_AS_QUERY, looksLikeTagFilter, parseTagFilter,
+} from './selection.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -37,6 +40,9 @@ const state = {
   // OSM has it wrong. Survives a recompute, and travels in metadata.json with
   // the route it produced.
   fixes: {},
+  // [{op, kind, text}]: which roads in the zones must be driven. Empty means
+  // all of them. See selection.js.
+  rules: [],
   streetLayers: [],    // one line per coverage state, while editing
   focusLayers: [],     // the hovered and selected streets, over those
   routeArrows: null,   // kept so the editor can hand the map back as it found it
@@ -589,7 +595,13 @@ mapEl.addEventListener('contextmenu', (ev) => {
    `state.regions` is a GeoJSON-style MultiPolygon in [lon, lat]: one entry per
    region, each an outline followed by any holes. */
 function applyShape(shape, op) {
-  const poly = [shapeRing(shape)];
+  applyGeometry([shapeRing(shape)], op);
+}
+
+// Merge a polygon or multipolygon, in polygon-clipping's [lon, lat] form, into
+// the zones - or cut it out of them. A drawn shape and an OSM boundary both
+// come through here, so a boundary zone is a zone like any other.
+function applyGeometry(poly, op) {
   let next;
   try {
     if (op === 'subtract') {
@@ -740,6 +752,7 @@ function syncClear() {
   // selector back to Add on its own, so it is never left armed over nothing.
   const empty = !state.regions.length;
   $('op-subtract').disabled = empty;
+  $('boundary-subtract').disabled = empty;
   // Keep out stays available: it bars roads rather than cropping the shape, so
   // it has something to do even before a zone is drawn.
   if (empty && $('op-subtract').checked) $('op-add').checked = true;
@@ -843,6 +856,69 @@ $('search').addEventListener('submit', async (ev) => {
   }
 });
 
+/* A zone from a boundary in OSM: a borough, a town, whatever Nominatim knows as
+   an area. Its outline arrives simplified - a threshold of 0.00002 degrees is
+   about 2 m, far below what decides whether a street is inside - because a
+   city's full outline runs to tens of thousands of points, and every one of
+   them is tested against every street downstream. One request a second, as
+   Nominatim's usage policy asks. */
+const BOUNDARY_THRESHOLD_DEG = 0.00002;
+
+async function lookupBoundary(name) {
+  const url = `${NOMINATIM}?format=jsonv2&limit=5&polygon_geojson=1`
+    + `&polygon_threshold=${BOUNDARY_THRESHOLD_DEG}&q=${encodeURIComponent(name)}`;
+  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error(`the geocoder answered ${res.status}`);
+  const hits = await res.json();
+  // The first hit with an outline: the first is often a station or a street
+  // named after the place.
+  const hit = hits.find((h) => h.geojson
+    && (h.geojson.type === 'Polygon' || h.geojson.type === 'MultiPolygon'));
+  if (!hit) {
+    throw new Error(hits.length
+      ? `"${name}" is not an area in OpenStreetMap`
+      : `no place found for "${name}"`);
+  }
+  // polygon-clipping takes GeoJSON's coordinates as they are.
+  return { label: hit.display_name, poly: hit.geojson.coordinates, type: hit.geojson.type };
+}
+
+$('boundary').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const form = $('boundary');
+  if (form.classList.contains('busy')) return;
+  const op = ev.submitter && ev.submitter.value === 'subtract' ? 'subtract' : 'add';
+  const names = $('boundary-input').value.split(';').map((s) => s.trim()).filter(Boolean);
+  if (!names.length) return;
+
+  form.classList.add('busy');
+  const buttons = form.querySelectorAll('button[type=submit]');
+  buttons.forEach((b) => { b.disabled = true; });
+  try {
+    const found = [];
+    for (let i = 0; i < names.length; i++) {
+      if (i) await new Promise((r) => setTimeout(r, 1100));
+      found.push(await lookupBoundary(names[i]));
+    }
+    for (const b of found) {
+      applyGeometry(b.type === 'Polygon' ? [b.poly] : b.poly, op);
+      console.info(`boundary zone (${op}): ${b.label}`);
+    }
+    if (state.regionLayers.length) {
+      map.fitBounds(L.featureGroup(state.regionLayers).getBounds(), { padding: [24, 24] });
+    }
+    hideMapAlert();
+  } catch (err) {
+    // Nothing is applied unless every name was found, so a typo in the second
+    // name does not leave the first one half-done.
+    showMapAlert(`Could not add that boundary: ${err.message}.`);
+  } finally {
+    form.classList.remove('busy');
+    $('boundary-add').disabled = false;
+    syncClear();
+  }
+});
+
 $('search-input').addEventListener('input', () => {
   $('search').classList.remove('missed');
 });
@@ -895,9 +971,10 @@ function validate() {
   const hours = sessionHours();
   markValid($('passes'), passes !== null);
   markValid($('session'), !sessionEnabled() || hours !== null);
+  const rules = validateRules();
   if (passes === null) return 'Passes must be a whole number of 1 or more.';
   if (hours === null) return 'Session length must be a number of hours between 0.1 and 24.';
-  return null;
+  return rules;
 }
 
 // The drawn area, or why it cannot be used.
@@ -910,6 +987,175 @@ function areaProblem() {
   }
 }
 
+/* -------------------------------------------------------- required roads */
+/* The selection rules, one card each. The DOM is rebuilt when a rule is added,
+   removed or changes op; typing only updates state.rules and the card's own
+   error line, so the field being typed into is never replaced under the caret. */
+const RULE_KIND_LABEL = { tags: 'Tag filter', overpass: 'Overpass query' };
+const RULE_PLACEHOLDER = {
+  tags: '["operator"="..."]',
+  overpass: 'way["operator"="..."];\n\nRuns on the road download\'s box unless the\nquery starts with settings of its own.\n{{bbox}} and {{geocodeArea:...}} work as in\noverpass-turbo.',
+};
+
+// Whatever a saved session or a hand-edited metadata.json holds, as rules the
+// form can show. The worker checks them properly; this only keeps the page up.
+function cleanRules(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((r) => r && (r.kind === 'tags' || r.kind === 'overpass'))
+    .map((r) => ({ op: r.op === 'remove' ? 'remove' : 'add', kind: r.kind, text: String(r.text ?? '') }))
+    .slice(0, MAX_RULES);
+}
+
+// What is wrong with one rule, or null. Tag filters are parsed here with the
+// worker's own parser, so a typo shows on the card rather than after a download.
+function ruleProblem(rule) {
+  const text = rule.text.trim();
+  if (!text) return 'Empty - write the rule or remove it.';
+  if (rule.kind === 'tags') {
+    try {
+      parseTagFilter(text);
+    } catch (err) {
+      return err.message.replace(/^tag filter "[\s\S]*?": /, '');
+    }
+  } else {
+    if (looksLikeTagFilter(text)) return TAG_FILTER_AS_QUERY[0].toUpperCase() + TAG_FILTER_AS_QUERY.slice(1);
+    const shortcut = /\{\{(?!\s*(?:bbox\s*|geocodeArea\s*:[^}]*)\}\})[^}]*\}\}/.exec(text);
+    if (shortcut) {
+      return `${shortcut[0]} is an overpass-turbo shortcut; only {{bbox}} and {{geocodeArea:...}} are filled in here.`;
+    }
+  }
+  return null;
+}
+
+function validateRules() {
+  let first = null;
+  $('rules').querySelectorAll('.rule').forEach((card, i) => {
+    const problem = ruleProblem(state.rules[i]);
+    card.querySelector('textarea').classList.toggle('invalid', problem !== null);
+    card.querySelector('.rule-error').textContent = problem || '';
+    if (problem && !first) first = `Required roads, rule ${i + 1}: ${problem}`;
+  });
+  return first;
+}
+
+function renderRules() {
+  const box = $('rules');
+  box.replaceChildren(...state.rules.map((rule, i) => {
+    const card = document.createElement('div');
+    card.className = 'rule';
+
+    const head = document.createElement('div');
+    head.className = 'rule-head';
+    const ops = document.createElement('div');
+    ops.className = 'segmented rule-op';
+    ops.setAttribute('role', 'radiogroup');
+    ops.setAttribute('aria-label', `Rule ${i + 1} adds or removes`);
+    for (const [value, label] of [['add', 'Add'], ['remove', 'Remove']]) {
+      const l = document.createElement('label');
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = `rule-op-${i}`;
+      input.value = value;
+      input.checked = rule.op === value;
+      input.addEventListener('change', () => { rule.op = value; rulesChanged(); });
+      const span = document.createElement('span');
+      span.textContent = label;
+      l.append(input, span);
+      ops.append(l);
+    }
+    const kind = document.createElement('span');
+    kind.className = 'rule-kind';
+    kind.textContent = RULE_KIND_LABEL[rule.kind];
+    const meta = document.createElement('span');
+    meta.className = 'rule-meta';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'rule-del';
+    del.setAttribute('aria-label', `Delete rule ${i + 1}`);
+    del.textContent = '×';
+    del.addEventListener('click', () => {
+      state.rules.splice(i, 1);
+      renderRules();
+      rulesChanged();
+    });
+    head.append(ops, kind, meta, del);
+
+    const text = document.createElement('textarea');
+    text.rows = rule.kind === 'tags' ? 2 : 5;
+    text.spellcheck = false;
+    text.autocomplete = 'off';
+    text.placeholder = RULE_PLACEHOLDER[rule.kind];
+    text.setAttribute('aria-label', `Rule ${i + 1}, ${RULE_KIND_LABEL[rule.kind]}`);
+    text.value = rule.text;
+    text.addEventListener('input', () => {
+      rule.text = text.value;
+      validateRules();
+      saveSession();       // debounced; a reload mid-sentence keeps the sentence
+    });
+    text.addEventListener('change', rulesChanged);
+
+    const error = document.createElement('p');
+    error.className = 'rule-error';
+
+    card.append(head, text, error);
+    return card;
+  }));
+  $('add-tag-rule').disabled = state.rules.length >= MAX_RULES;
+  $('add-query-rule').disabled = state.rules.length >= MAX_RULES
+    || state.rules.filter((r) => r.kind === 'overpass').length >= MAX_QUERY_RULES;
+  syncRulesInfo();
+}
+
+/* The line under the list, and each card's count from the last compute - but
+   only while the rules are still the ones that compute ran with, or the counts
+   would be answering a question nobody is asking any more. */
+function syncRulesInfo() {
+  $('rules-hint').textContent = state.rules.length
+    ? 'Only the roads the rules select must be driven. The rest can still be driven to get between them.'
+    : 'No rules: every road inside the zones must be driven.';
+  const res = state.result;
+  const ran = res?.request?.selection;
+  const stats = res?.coverage?.selection;
+  const current = state.rules.map(({ op, kind, text }) => ({ op, kind, text: text.trim() }));
+  const fresh = Array.isArray(ran) && Array.isArray(stats) && stats.length === current.length
+    && JSON.stringify(ran) === JSON.stringify(current);
+  $('rules').querySelectorAll('.rule-meta').forEach((meta, i) => {
+    const s = fresh ? stats[i] : null;
+    meta.classList.toggle('warn', !!s && (s.matched === 0 || s.missing > 0));
+    if (!s) { meta.textContent = ''; meta.title = ''; return; }
+    meta.textContent = s.missing > 0
+      ? `${s.matched} ways · ${s.missing} not drivable`
+      : `${s.matched} ${s.matched === 1 ? 'way' : 'ways'}`;
+    meta.title = s.missing > 0
+      ? 'Ways the query returned that are not drivable roads in the download: footways, '
+        + 'tracks, or service and private roads while Include service roads is off.'
+      : 'Downloaded ways this rule matched, inside the zones or not.';
+  });
+}
+
+function rulesChanged() {
+  // A different question gives a different set of streets; see the settings.
+  dropBaseline();
+  validateRules();
+  syncRulesInfo();
+  scheduleCheck();
+  saveSession();
+}
+
+function addRule(kind) {
+  // The first rule adds: a list starting from nothing is the usual question.
+  state.rules.push({ op: 'add', kind, text: '' });
+  renderRules();
+  const cards = $('rules').querySelectorAll('.rule textarea');
+  cards[cards.length - 1].focus();
+  saveSession();
+}
+
+$('add-tag-rule').addEventListener('click', () => addRule('tags'));
+$('add-query-rule').addEventListener('click', () => addRule('overpass'));
+renderRules();
+
 /* --------------------------------------------------------------- request */
 function payload() {
   const body = {
@@ -920,6 +1166,7 @@ function payload() {
     // better answered by the editor, street by street. See DEAD_END_MIN_M.
     dead_end_m: config.DEAD_END_MIN_M,
     overrides: state.fixes,
+    selection: state.rules,
     both_directions: bothDirections(),
     passes: passesValue() || 1,
     session_minutes: (sessionHours() || NO_SPLIT_HOURS) * 60,
@@ -1094,6 +1341,7 @@ function formState() {
     includePrivate: includePrivate(),
     deadEndM: config.DEAD_END_MIN_M,
     fixes: state.fixes,
+    selection: state.rules,
     passes: passesValue() || 1,
     splitSessions: sessionEnabled(),
     sessionHours: sessionHours() || NO_SPLIT_HOURS,
@@ -1169,6 +1417,8 @@ function restoreRoute(meta, { fit = true } = {}) {
   clearRoute();
   state.regions = Array.isArray(view.regions) ? view.regions : [];
   state.fixes = (form.fixes && typeof form.fixes === 'object') ? { ...form.fixes } : {};
+  state.rules = cleanRules(form.selection);
+  renderRules();
   drawRegions();
 
   if (view.start) setStart(L.latLng(view.start.lat, view.start.lon));
@@ -2116,13 +2366,16 @@ function renderResult(res) {
   const st = res.stats;
   const cov = res.coverage;
   const sessions = res.sessions;
+  // With rules, "in area" is what they selected there, not every road.
+  const selective = Array.isArray(res.request?.selection) && res.request.selection.length > 0;
+  syncRulesInfo();
   $('summary').innerHTML = [
     ['Distance', `${st.total_km} km`],
     ['Driving', st.duration, DRIVING_TIP],
     ['Sessions', sessions.length],
     ['Roads covered', `${cov.centerline_km_covered} km`],
     ['Coverage', `${cov.coverage_pct}%`],
-    ['Roads in area', `${cov.centerline_km_in_area} km`],
+    [selective ? 'Selected in area' : 'Roads in area', `${cov.centerline_km_in_area} km`],
     ['Unreachable', `${cov.km_dropped_not_strongly_connected} km`],
     ['Coverage modifiers', fixCount(), MODIFIERS_TIP],
   ].map(([label, value, tip]) =>
@@ -2465,6 +2718,7 @@ function clearRoute() {
   $('legend').innerHTML = '';
   $('legend').classList.add('hidden');
   state.result = null;
+  syncRulesInfo();
   $('stats-card').classList.add('hidden');
   state.routeArrows = null;
   state.pickingRoad = false;

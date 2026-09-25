@@ -20,7 +20,10 @@ export class Graph {
      something, which must not show up in the reported duration.
 
      `connector` marks a road present only so the route can reach something -
-     drivable like any arc, never required. See connectorFilter() in osm.js. */
+     drivable like any arc, never required. See connectorFilter() in osm.js.
+
+     `optional` marks a road the selection rules left out - drivable at its
+     plain cost, never required. See selection.js. */
   constructor(ids, xs, ys, arcs) {
     const N = ids.length, E = arcs.length;
     this.N = N; this.E = E;
@@ -48,6 +51,7 @@ export class Graph {
     this.refs = new Array(E);
     this.highway = new Array(E);
     this.connector = new Uint8Array(E);
+    this.optional = new Uint8Array(E);
     for (let a = 0; a < E; a++) {
       const r = arcs[a];
       this.tail[a] = r.u; this.head[a] = r.v;
@@ -57,6 +61,7 @@ export class Graph {
       this.ways[a] = r.ways || [];
       this.names[a] = r.names; this.refs[a] = r.refs; this.highway[a] = r.highway;
       this.connector[a] = r.connector ? 1 : 0;
+      this.optional[a] = r.optional ? 1 : 0;
       // Integer costs, so shortest-path comparisons are exact.
       this.cost[a] = Math.max(Math.round(r.cost ?? r.travel * MCF_TIME_SCALE), 1);
     }
@@ -160,6 +165,7 @@ export class Graph {
         osmids: this.osmKey[a].split(','), ways: this.ways[a],
         names: this.names[a], refs: this.refs[a],
         highway: this.highway[a], connector: this.connector[a], cost: this.cost[a],
+        optional: this.optional[a],
       });
     }
     const graph = new Graph(ids, xs, ys, arcs);

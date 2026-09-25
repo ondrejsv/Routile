@@ -54,6 +54,23 @@
       </div>
     </div>
 
+    <!-- A zone taken from a boundary in OpenStreetMap instead of drawn: a
+         borough, a town. Merged with the drawn ones exactly as a drawn zone is;
+         see addBoundaryZones() in app.js. -->
+    <form id="boundary" class="boundary" autocomplete="off">
+      <label class="field">
+        <span>Zone from OSM boundary<button type="button" class="info"
+              aria-label="How boundary zones work"
+              data-tip="Looks each name up on Nominatim and uses the outline of the area it finds, such as a borough or a town, as a zone. Separate several names with ;. Add merges them with the zones already there; Subtract cuts them out."><svg
+              viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="M12 2.5a9.5 9.5 0 1 0 0 19 9.5 9.5 0 1 0 0-19zM12 6.9a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 1 0 0-2.6zM10.85 12.35a1.15 1.15 0 0 1 2.3 0v3.5a1.15 1.15 0 0 1-2.3 0z"/></svg></button></span>
+        <input type="text" id="boundary-input" placeholder="Bratislava - Petržalka; Bratislava - Rusovce">
+      </label>
+      <div class="rule-adders">
+        <button type="submit" class="ghost" id="boundary-add" value="add">Add zone</button>
+        <button type="submit" class="ghost" id="boundary-subtract" value="subtract" disabled>Subtract</button>
+      </div>
+    </form>
+
     <section class="block">
       <div class="field">
         <span>Direction</span>
@@ -98,6 +115,21 @@
         <input type="text" id="session" value="2" inputmode="decimal"
                placeholder="2" autocomplete="off">
       </label>
+    </section>
+
+    <!-- Which roads in the zones must be driven. Rows are built by the rules
+         code in app.js from state.rules; see selection.js for what they mean. -->
+    <section class="block" id="rules-block">
+      <h2>Required roads<button type="button" class="info"
+          aria-label="How the rules work"
+          data-tip="Rules run top to bottom, each adding roads to the selection or taking them out of it. A list starting with Add starts from no roads, one starting with Remove from all of them. Only selected roads inside the zones must be driven; the others can still be driven to get between them."><svg
+          viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="M12 2.5a9.5 9.5 0 1 0 0 19 9.5 9.5 0 1 0 0-19zM12 6.9a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 1 0 0-2.6zM10.85 12.35a1.15 1.15 0 0 1 2.3 0v3.5a1.15 1.15 0 0 1-2.3 0z"/></svg></button></h2>
+      <div id="rules" class="rules"></div>
+      <div class="rule-adders">
+        <button type="button" class="ghost" id="add-tag-rule">+ Tag filter</button>
+        <button type="button" class="ghost" id="add-query-rule">+ Overpass query</button>
+      </div>
+      <p class="hint" id="rules-hint"></p>
     </section>
 
     <button id="compute" class="primary" disabled>Compute route</button>

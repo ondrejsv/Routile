@@ -15,6 +15,7 @@ import { eulerianCircuit, verifyCircuit } from './euler.js';
 import { reduceTour } from './waypoints.js';
 import { chunkWaypoints, groupSessions, verifyChunks } from './sessions.js';
 import { summarise } from './stats.js';
+import { SelectionError, parseRules, rulesKey, rulesToJSON } from './selection.js';
 
 // Ordered phases for the progress bar. The min-cost flow has no natural
 // granularity, so it gets an indeterminate bar rather than a fake percentage.
@@ -85,12 +86,20 @@ export function parseRequest(payload) {
   if (!(deadEndM >= 0 && deadEndM <= config.DEAD_END_MAX_M)) {
     throw new RequestError(`shortest dead end must be between 0 and ${config.DEAD_END_MAX_M} metres`);
   }
+  let selection;
+  try {
+    selection = parseRules(payload.selection);
+  } catch (err) {
+    if (err instanceof SelectionError) throw new RequestError(err.message);
+    throw err;
+  }
   const start = payload.start || null;
   return {
     area,
     includePrivate: Boolean(payload.include_private ?? config.INCLUDE_PRIVATE_DEFAULT),
     deadEndM,
     overrides: parseOverrides(payload.overrides),
+    selection,
     startLon: start && start.lon != null ? Number(start.lon) : null,
     startLat: start && start.lat != null ? Number(start.lat) : null,
     bothDirections: Boolean(payload.both_directions ?? config.BOTH_DIRECTIONS_DEFAULT),
@@ -115,6 +124,7 @@ export function requestKey(req) {
     round6(req.startLon ?? 0), round6(req.startLat ?? 0),
     req.includePrivate, req.deadEndM,
     [...req.overrides].map(([w, f]) => `${w}:${f.drive}`).sort(),
+    rulesKey(req.selection),
     req.bothDirections, req.passes, req.sessionSeconds,
     req.margin, req.maxLegMetres, req.maxLegArcs,
   ]);
@@ -146,6 +156,7 @@ export async function compute(req, { progress = null, cache = null } = {}) {
     minInsideM: config.REQUIRED_MIN_INSIDE_M,
     deadEndMinM: req.deadEndM,
     overrides: req.overrides,
+    selection: req.selection,
     includePrivate: req.includePrivate,
     progress: say,
     cache,
@@ -211,6 +222,7 @@ export async function compute(req, { progress = null, cache = null } = {}) {
       area: req.area.toJSON(),
       start: req.startLon !== null ? { lon: req.startLon, lat: req.startLat } : null,
       include_private: req.includePrivate,
+      selection: rulesToJSON(req.selection),
       both_directions: req.bothDirections,
       passes: req.passes,
       session_minutes: Math.round(req.sessionSeconds / 60),
@@ -250,6 +262,7 @@ function roadList(g, circuit, track, trackWay) {
         // change from something rather than in the abstract.
         oneway: g.reciprocal[arc] < 0,
         connector: !!g.connector[arc],
+        optional: !!g.optional[arc],
         metres: 0,
         spans: [],
       });

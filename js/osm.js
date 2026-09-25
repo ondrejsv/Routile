@@ -21,8 +21,14 @@
 import * as config from './config.js';
 import { geomLengthDeg, geomLengthM, haversineM, insideLengthDeg, pointInPolygon, ringBounds } from './geo.js';
 import { Graph, stronglyConnectedComponents, weakComponents } from './graph.js';
+import {
+  SelectionError, fillGeocodeAreas, geocodeAreaNames, selectWays, selectionQuery, waysOf,
+} from './selection.js';
 
 export class FetchError extends Error {}
+
+// Overpass refused the query itself. Retrying cannot help; the text can.
+class BadQueryError extends Error {}
 export class NoRoadsError extends Error {}
 
 /* OSMnx's "drive" filter: the public streets a car may use. `includePrivate`
@@ -97,6 +103,13 @@ export function overpassQuery(box, profile) {
 const useConnectors = ({ includePrivate = false } = {}) =>
   config.INCLUDE_CONNECTORS && !includePrivate;
 
+// The handful of entities Overpass's error page uses, so a message quotes its
+// query as "this" rather than &quot;this&quot;.
+const ENTITIES = { quot: '"', apos: "'", lt: '<', gt: '>', amp: '&' };
+const decodeEntities = (text) => text
+  .replace(/&(quot|apos|lt|gt|amp);/g, (all, name) => ENTITIES[name])
+  .replace(/&#(\d+);/g, (all, code) => String.fromCharCode(Number(code)));
+
 async function postQuery(endpoint, query) {
   const control = new AbortController();
   const timer = setTimeout(() => control.abort(), config.OVERPASS_HTTP_TIMEOUT_MS);
@@ -107,6 +120,15 @@ async function postQuery(endpoint, query) {
       body: 'data=' + encodeURIComponent(query),
       signal: control.signal,
     });
+    if (res.status === 400) {
+      // An HTML page with the parser's complaints in it; the complaints are
+      // what is worth keeping.
+      const page = await res.text().catch(() => '');
+      const said = decodeEntities(page.replace(/<[^>]*>/g, ' ')).split('\n')
+        .map((s) => s.replace(/\s+/g, ' ').trim())
+        .filter((s) => /error/i.test(s)).slice(0, 3).join(' ');
+      throw new BadQueryError(said || 'Overpass rejected the query');
+    }
     if (!res.ok) throw new Error(`Overpass answered HTTP ${res.status}`);
     return await res.json();
   } finally {
@@ -145,6 +167,84 @@ export async function fetchOverpass(box, { profile, cache = null, progress = nul
   }
   throw new FetchError(
     'Could not reach OpenStreetMap to download the roads. Its public Overpass '
+    + 'service is free and often overloaded - wait a moment and try again. '
+    + `(${last ? last.message : 'no response'})`,
+  );
+}
+
+/* The way ids one of the user's selection queries returns, cached like the road
+   download and keyed by the full query text, which carries the box. An empty
+   answer is an answer here, not a failure: the rule simply selects nothing, and
+   the report says so. */
+const SELECTION_CACHE_VERSION = 1;
+
+/* Nominatim's answer for each {{geocodeArea:name}} in a query: the first hit
+   that is an area, as overpass-turbo takes it. Cached, and one request a second
+   when not, which is Nominatim's usage policy. A boundary does not move between
+   computes, and asking again for every rule of every run would be rude. */
+const NOMINATIM = 'https://nominatim.openstreetmap.org/search';
+const GEOCODE_CACHE_VERSION = 1;
+let lastGeocodeAt = 0;
+
+async function geocodeAreas(names, { cache = null, progress = null } = {}) {
+  const found = new Map();
+  for (const name of names) {
+    const key = `geocode/v${GEOCODE_CACHE_VERSION}|${name}`;
+    const hit = cache ? await cache.get('overpass', key) : null;
+    if (hit) { found.set(name, hit); continue; }
+    if (progress) progress('fetch', `looking up "${name}"`);
+    const wait = lastGeocodeAt + 1100 - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastGeocodeAt = Date.now();
+    let results;
+    try {
+      const res = await fetch(`${NOMINATIM}?format=jsonv2&limit=5&q=${encodeURIComponent(name)}`);
+      if (!res.ok) throw new Error(`Nominatim answered HTTP ${res.status}`);
+      results = await res.json();
+    } catch (err) {
+      throw new FetchError(`Could not look up "${name}" for {{geocodeArea}}: ${err.message}`);
+    }
+    const area = (results || []).find((r) => r.osm_type === 'relation' || r.osm_type === 'way');
+    if (!area) continue;               // named in fillGeocodeAreas()'s error
+    const answer = { osm_type: area.osm_type, osm_id: area.osm_id, name: area.display_name };
+    console.info(`{{geocodeArea:${name}}} is ${area.osm_type} ${area.osm_id}, ${area.display_name}`);
+    if (cache) await cache.put('overpass', key, answer);
+    found.set(name, answer);
+  }
+  return found;
+}
+
+export async function fetchSelection(text, box, { cache = null, progress = null, label = 'query' } = {}) {
+  const names = geocodeAreaNames(text);
+  if (names.length) text = fillGeocodeAreas(text, await geocodeAreas(names, { cache, progress }));
+  const query = selectionQuery(text, box, config.OVERPASS_QUERY_TIMEOUT_S);
+  const key = `selection/v${SELECTION_CACHE_VERSION}|${query}`;
+  const hit = cache ? await cache.get('overpass', key) : null;
+  if (hit) return new Set(hit);
+
+  let last = null;
+  for (let attempt = 0; attempt < config.OVERPASS_RETRIES; attempt++) {
+    const endpoint = config.OVERPASS_ENDPOINTS[attempt % config.OVERPASS_ENDPOINTS.length];
+    try {
+      const json = await postQuery(endpoint, query);
+      if (json.remark && /error/i.test(json.remark)) throw new BadQueryError(json.remark);
+      const ids = waysOf(json.elements);
+      if (cache) await cache.put('overpass', key, [...ids]);
+      return ids;
+    } catch (err) {
+      if (err instanceof BadQueryError) {
+        throw new SelectionError(`Overpass could not run the ${label}: ${err.message}`);
+      }
+      last = err;
+      console.warn(`selection query failed on ${endpoint} (attempt ${attempt + 1}/${config.OVERPASS_RETRIES}):`, err.message);
+      if (attempt + 1 < config.OVERPASS_RETRIES) {
+        if (progress) progress('fetch', 'OpenStreetMap is busy - retrying');
+        await sleep(config.OVERPASS_RETRY_DELAY_MS);
+      }
+    }
+  }
+  throw new FetchError(
+    `Could not reach OpenStreetMap to run the ${label}. Its public Overpass `
     + 'service is free and often overloaded - wait a moment and try again. '
     + `(${last ? last.message : 'no response'})`,
   );
@@ -216,7 +316,9 @@ function push(map, key, value) {
   if (list) list.push(value); else map.set(key, [value]);
 }
 
-function fromElements(elements, connectors, overrides = new Map()) {
+/* `selected` is the set of way ids the selection rules picked, or null when
+   there are none and every road may be required. */
+function fromElements(elements, connectors, overrides = new Map(), selected = null) {
   const coords = new Map();
   const ways = [];
   for (const el of elements) {
@@ -250,6 +352,9 @@ function fromElements(elements, connectors, overrides = new Map()) {
         ? fix.drive === 'access'
         : connectors && tags.highway === 'service' && !tags.service
           && !CONNECTOR_KEYS.some((k) => tags[k] && new RegExp(`^(${CONNECTOR_DENY})$`).test(tags[k])),
+      // Left out by the selection rules: drivable at its plain cost, never
+      // required. Not a connector, which the route is priced to avoid.
+      optional: selected !== null && !selected.has(String(way.id)),
     };
     for (let i = 1; i < ids.length; i++) raw.addEdge({ u: ids[i - 1], v: ids[i], ...attrs, geom: null });
     if (!oneway) {
@@ -282,11 +387,18 @@ function truncateToBox(raw, box) {
 /* --------------------------------------------------------- simplification */
 // A node is a real junction unless it merely joins two segments end to end:
 // two neighbours, with one lane through (degree 2) or two-way both sides (4).
+//
+// Also wherever the selection starts or stops. Coverage is junction to
+// junction, so an arc merged across that boundary would be required or not as
+// a whole, and a selected street ending mid-run would be dropped or dragged on.
 function isEndpoint(raw, v) {
   const outE = raw.outEdges(v), inE = raw.inEdges(v);
   const neigh = raw.neighbours(v);
   if (neigh.has(v)) return true;                       // self-loop
   if (outE.length === 0 || inE.length === 0) return true;
+  const optional = raw.edges[outE[0]].optional;
+  for (const e of outE) if (raw.edges[e].optional !== optional) return true;
+  for (const e of inE) if (raw.edges[e].optional !== optional) return true;
   const d = outE.length + inE.length;
   return !(neigh.size === 2 && (d === 2 || d === 4));
 }
@@ -359,6 +471,8 @@ function simplify(raw) {
       highway: segs[0].highway,
       // A merged run is only a connector if all of it is.
       connector: segs.every((s) => s.connector),
+      // Uniform along the run: isEndpoint() splits wherever it changes.
+      optional: segs[0].optional,
       // Differing limits along a merged street cannot be trusted either way;
       // let the road type decide, as OSMnx does.
       maxspeed: speeds.size === 1 ? segs[0].maxspeed : null,
@@ -428,8 +542,8 @@ function assignTravelTimes(edges) {
 
 /* ------------------------------------------------------------- assembly */
 export function buildGraph(elements, fetchBox, downloadBox, profile = {},
-                           overrides = new Map()) {
-  const raw = fromElements(elements, useConnectors(profile), overrides);
+                           overrides = new Map(), selected = null) {
+  const raw = fromElements(elements, useConnectors(profile), overrides, selected);
   truncateToBox(raw, downloadBox);
   simplify(raw);
   truncateToBox(raw, fetchBox);
@@ -453,7 +567,7 @@ export function buildGraph(elements, fetchBox, downloadBox, profile = {},
   const arcs = raw.edges.map((e) => ({
     u: index.get(e.u), v: index.get(e.v), length: e.length, travel: e.travel,
     geom: e.geom, osmids: e.osmids, ways: e.ways, names: e.names, refs: e.refs,
-    highway: e.highway, connector: e.connector,
+    highway: e.highway, connector: e.connector, optional: e.optional,
   }));
   const g = new Graph(ids, xs, ys, arcs);
   ids.forEach((id, i) => { if (raw.severed.has(id)) g.severed[i] = 1; });
@@ -590,8 +704,9 @@ export function markRequired(g, area, minInsideM, {
 
   const required = new Uint8Array(g.E);
   for (let a = 0; a < g.E; a++) {
-    // A connector is here to reach a street, not to be one.
-    if (g.connector[a]) continue;
+    // A connector is here to reach a street, not to be one; an optional road
+    // is one the selection rules left out.
+    if (g.connector[a] || g.optional[a]) continue;
     if (deadEndStub(g, a, deadEndMinM)) continue;
     if (severedStub(g, a)) continue;
     const geom = g.geom[a];
@@ -686,7 +801,24 @@ export function coverageSummary(r) {
     text += ` - ${r.km_dropped_not_strongly_connected.toFixed(1)} km could not be reached `
       + `by car from the rest of the network (${fragments} separate fragments)`;
   }
+  const note = selectionNote(r.selection || []);
+  if (note) text += ` - ${note}`;
   return text;
+}
+
+/* What went wrong with the selection rules, if anything did: a rule matching
+   nothing, or a query naming ways the road download does not have - a footway,
+   or a service road with Include service roads off. Numbered as the panel
+   lists them. */
+export function selectionNote(stats) {
+  const notes = [];
+  stats.forEach((s, i) => {
+    if (s.matched === 0 && s.missing === 0) notes.push(`rule ${i + 1} matched no roads`);
+    else if (s.missing > 0) {
+      notes.push(`rule ${i + 1}: ${s.missing} of the ways its query returned are not drivable roads in the download`);
+    }
+  });
+  return notes.join('; ');
 }
 
 export function coverageToDict(r) {
@@ -701,6 +833,7 @@ export function coverageToDict(r) {
     dropped_arcs: r.dropped_arcs,
     weak_components: r.weak_components,
     strong_components: r.strong_components,
+    selection: (r.selection || []).map(({ op, kind, matched, missing }) => ({ op, kind, matched, missing })),
     summary: coverageSummary(r),
   };
 }
@@ -710,7 +843,7 @@ const round = (v, d) => Math.round(v * 10 ** d) / 10 ** d;
 // Fetch, mark required arcs, prune to the largest strongly connected component.
 export async function prepare(area, { bufferM, snapDeg, minInsideM,
                                       deadEndMinM = config.DEAD_END_MIN_M,
-                                      overrides = new Map(),
+                                      overrides = new Map(), selection = [],
                                       includePrivate = false, progress = null, cache = null }) {
   const say = progress || (() => {});
 
@@ -720,7 +853,26 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
   say('fetch', `downloading roads for ${fetchBox.areaKm2().toFixed(1)} km2`);
   const profile = { includePrivate };
   const elements = await fetchOverpass(downloadBox, { profile, cache, progress: say });
-  const G = buildGraph(elements, fetchBox, downloadBox, profile, overrides);
+
+  // The user's own queries, against the same box, one at a time: Overpass
+  // allows a client only a couple of slots, and the road download has one.
+  const queries = selection.filter((r) => r.kind === 'overpass').length;
+  const querySets = [];
+  for (let i = 0, k = 0; i < selection.length; i++) {
+    if (selection[i].kind !== 'overpass') continue;
+    k++;
+    say('fetch', `running selection query ${k} of ${queries}`);
+    querySets[i] = await fetchSelection(selection[i].text, downloadBox, {
+      cache, progress: say, label: `selection query ${k}`,
+    });
+  }
+  const ways = elements.filter((el) => el.type === 'way');
+  const { selected, stats: selectionStats } = selectWays(selection, ways, querySets);
+  if (selected) {
+    console.info(`selection: ${selected.size} of ${ways.length} downloaded ways selected`, selectionStats);
+  }
+
+  const G = buildGraph(elements, fetchBox, downloadBox, profile, overrides, selected);
   if (overrides.size) console.info(`${overrides.size} road fixes applied`);
   let connectorArcs = 0;
   for (let a = 0; a < G.E; a++) if (G.connector[a]) connectorArcs++;
@@ -731,6 +883,7 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
     centerline_km_in_area: 0, centerline_km_covered: 0,
     km_dropped_not_strongly_connected: 0,
     required_arcs: 0, dropped_arcs: 0, weak_components: 0, strong_components: 0,
+    selection: selectionStats,
   };
 
   say('mark', 'identifying roads inside the drawn area');
@@ -781,6 +934,10 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
   report.centerline_km_covered = centerlineKm(H, requiredArcs.concat(uturnOnly));
 
   if (!requiredArcs.length) {
+    if (selected) {
+      throw new NoRoadsError('none of the roads the selection rules pick lie inside the drawn area'
+        + ` - ${selectionNote(selectionStats) || 'check the rules against the area'}`);
+    }
     throw new NoRoadsError('no drivable roads inside the drawn area - try a larger area');
   }
   console.info(`required ${requiredArcs.length} arcs; ${coverageSummary(report)}`);

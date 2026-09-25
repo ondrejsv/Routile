@@ -20,6 +20,15 @@ Draw an area, get a driving route that covers every street in it. A static web p
 
 The page remembers where you left it. A reload brings back the zones, the settings and the route; **Clear** is what forgets them.
 
+## Required roads
+
+By default every drivable road inside the zones must be driven. **Required roads** narrows that down with a list of rules, run top to bottom, each one adding roads to the selection or removing them from it:
+
+- **Tag filter** — an Overpass tag filter such as `["operator"="..."]` or `[highway~"^(primary|secondary)$"]`, checked against the roads already downloaded.
+- **Overpass query** — a query of your own, e.g. `way["operator"="..."];`. It runs on the same box as the road download unless it starts with settings of its own (`[out:json][timeout:120];`). `{{bbox}}` and `{{geocodeArea:...}}` work as they do in overpass-turbo, the latter looked up on Nominatim. Ways it returns are selected, and so are the way members of any relations it returns.
+
+A list starting with Add starts from no roads, one starting with Remove from all of them. Only selected roads inside the zones must be driven. The rest stay drivable at their normal cost, so the route can still use them to get between selected ones. After a compute each rule shows how many ways it matched. It warns when a rule matched nothing, and when a query returned ways that are not drivable roads in the download (footways, or service roads while **Include service roads** is off).
+
 ## Edit coverage
 
 OpenStreetMap is sometimes wrong — a one-way street tagged as two-way, a private lane tagged as public — and the route then asks you to do something you cannot legally do.

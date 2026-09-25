@@ -7,7 +7,7 @@
 export const VERSION = '1.0.0';
 
 // Bump on ANY algorithm change, or the result cache serves stale routes.
-export const ALGO_VERSION = '16';
+export const ALGO_VERSION = '17';
 
 // -------------------------------------------------------------------- basemap
 // Throw away key for this project - an actual human comment
