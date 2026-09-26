@@ -22,7 +22,8 @@ import * as config from './config.js';
 import { geomLengthDeg, geomLengthM, haversineM, insideLengthDeg, pointInPolygon, ringBounds } from './geo.js';
 import { Graph, stronglyConnectedComponents, weakComponents } from './graph.js';
 import {
-  SelectionError, fillGeocodeAreas, geocodeAreaNames, selectWays, selectionQuery, waysOf,
+  SelectionError, fillGeocodeAreas, geocodeAreaNames, matchesTags, parseRules, selectWays,
+  selectionQuery, waysOf,
 } from './selection.js';
 
 export class FetchError extends Error {}
@@ -177,15 +178,19 @@ export async function fetchOverpass(box, { profile, cache = null, progress = nul
    * `ways` - every highway=* within `radiusM`, tags and geometry. Any highway
      at all, not just what the road filter downloads: the point is to see what
      OSM says, footway or not.
-   * `areas` - the administrative and cadastral areas the point lies in, from
-     the local part up to the country, most local first. An area's id is its
-     relation's plus 3600000000, which is what area(id:...) takes.
+   * `areas` - the areas the point lies in, most local first: named landuse
+     and neighbourhood outlines (a housing estate, an industrial park), then
+     the administrative and cadastral ones up to the country. Each carries
+     `id`, what area(id:...) takes, and the OSM object it was made from.
 
    Two tries, not four - someone is waiting on a click. */
+const IDENTIFY_PLACES = 'suburb|quarter|neighbourhood|city_block';
+
 export async function fetchIdentify(lat, lon, radiusM) {
   const at = `${lat.toFixed(6)},${lon.toFixed(6)}`;
   const query = `[out:json][timeout:25];way(around:${Math.round(radiusM)},${at})["highway"];out tags geom;`
-    + `is_in(${at})->.in;area.in["boundary"~"^(administrative|cadastral)$"];out tags;`;
+    + `is_in(${at})->.in;(area.in["boundary"~"^(administrative|cadastral)$"];`
+    + `area.in["landuse"]["name"];area.in["place"~"^(${IDENTIFY_PLACES})$"]["name"];);out tags;`;
   let last = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     const endpoint = config.OVERPASS_ENDPOINTS[attempt % config.OVERPASS_ENDPOINTS.length];
@@ -194,14 +199,29 @@ export async function fetchIdentify(lat, lon, radiusM) {
       if (json.remark && /error/i.test(json.remark)) throw new Error(json.remark);
       const elements = json.elements || [];
       const level = (a) => {
-        // Cadastral areas carry no admin_level; they sit with the borough.
-        const n = parseInt(a.tags?.admin_level, 10);
-        return Number.isFinite(n) ? n : a.tags?.boundary === 'cadastral' ? 9.5 : 0;
+        // Cadastral areas carry no admin_level and sit with the borough; a
+        // landuse or neighbourhood outline is smaller than any of them.
+        const n = parseInt(a.tags.admin_level, 10);
+        if (Number.isFinite(n)) return n;
+        return a.tags.boundary === 'cadastral' ? 9.5 : 20;
       };
+      /* An area made from a relation comes back as type area, id plus
+         3600000000. One made from a closed way comes back as the way itself,
+         under the way's own id - which is also what area(id:...) takes for it.
+         Told apart from the roads above by having no geometry: those were
+         asked for with it. */
+      const areas = [];
+      for (const el of elements) {
+        if (!el.tags?.name || Array.isArray(el.geometry)) continue;
+        if (el.type === 'area' && el.id >= 3600000000) {
+          areas.push({ id: el.id, osmType: 'relation', osmId: el.id - 3600000000, tags: el.tags });
+        } else if (el.type === 'way') {
+          areas.push({ id: el.id, osmType: 'way', osmId: el.id, tags: el.tags });
+        }
+      }
       return {
         ways: elements.filter((el) => el.type === 'way' && Array.isArray(el.geometry)),
-        areas: elements.filter((el) => el.type === 'area' && el.tags?.name)
-          .sort((a, b) => level(b) - level(a)),
+        areas: areas.sort((a, b) => level(b) - level(a)),
       };
     } catch (err) {
       last = err;
@@ -887,8 +907,7 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
   const say = progress || (() => {});
 
   // Download the enclosing box; require only the roads inside the shape.
-  const fetchBox = area.bounds.bufferM(bufferM).snapOut(snapDeg);
-  const downloadBox = fetchBox.bufferM(config.DOWNLOAD_MARGIN_M);
+  const { fetchBox, downloadBox } = roadBoxes(area, bufferM, snapDeg);
   say('fetch', `downloading roads for ${fetchBox.areaKm2().toFixed(1)} km2`);
   const profile = { includePrivate };
   const elements = await fetchOverpass(downloadBox, { profile, cache, progress: say });
@@ -981,6 +1000,57 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
   }
   console.info(`required ${requiredArcs.length} arcs; ${coverageSummary(report)}`);
   return { graph: H, required, restricted: turnRestrictions(H, elements), report };
+}
+
+/* The two boxes a compute works in: the fetch box the graph is trimmed to, and
+   the download box around it. Shared with the rule preview, so what it shows
+   is drawn from the very download a compute of the same zones would use - the
+   same cache entry, fetched once for both. */
+export function roadBoxes(area, bufferM = config.fetchBufferM(area.areaKm2()),
+                          snapDeg = config.BBOX_SNAP_DEG) {
+  const fetchBox = area.bounds.bufferM(bufferM).snapOut(snapDeg);
+  return { fetchBox, downloadBox: fetchBox.bufferM(config.DOWNLOAD_MARGIN_M) };
+}
+
+/* One selection rule's own matches among the downloaded roads, as lines to
+   draw: what the rule picks on its own, not what the list adds up to, since
+   testing one rule is the point. Checked exactly as a compute checks it -
+   parseRules() for the text, matchesTags() or the rule's own query for the
+   match, the road download for what there is to match. A query's ways that
+   are not in the download are counted, as the compute's report counts them. */
+export async function previewRule(raw, area, { includePrivate = false, cache = null, progress = null } = {}) {
+  const [rule] = parseRules([raw]);
+  if (!rule) throw new SelectionError('the rule is empty');
+  const { downloadBox } = roadBoxes(area);
+  const elements = await fetchOverpass(downloadBox, { profile: { includePrivate }, cache, progress });
+  const coords = new Map();
+  const ways = [];
+  for (const el of elements) {
+    if (el.type === 'node') coords.set(el.id, [el.lat, el.lon]);
+    else if (el.type === 'way' && el.nodes) ways.push(el);
+  }
+  let hits;
+  let missing = 0;
+  if (rule.kind === 'tags') {
+    hits = ways.filter((w) => matchesTags(rule.clauses, w.tags || {}));
+  } else {
+    if (progress) progress('fetch', 'running the query');
+    const ids = await fetchSelection(rule.text, downloadBox, { cache, progress, label: 'query' });
+    hits = ways.filter((w) => ids.has(String(w.id)));
+    missing = ids.size - hits.length;
+  }
+  /* Split by whether any of the way lies in a zone: only those can be
+     required, and the rest - the download reaches kilometres past the zones -
+     are drawn faint so the ones that count stand out. A node inside is the
+     test, which is close enough for a look; markRequired() is the exact one. */
+  const inside = [], outside = [];
+  for (const w of hits) {
+    const line = w.nodes.map((id) => coords.get(id)).filter(Boolean);
+    if (line.length < 2) continue;
+    const isIn = line.some(([lat, lon]) => area.regions.some((rings) => pointInPolygon(rings, lon, lat)));
+    (isIn ? inside : outside).push(line);
+  }
+  return { inside, outside, matched: hits.length, missing };
 }
 
 /* Graph node closest to a point, among `candidates` (a node mask) if given.

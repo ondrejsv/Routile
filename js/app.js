@@ -5,7 +5,7 @@ import { Area } from './area.js';
 import { DetailLayer } from './detail.js';
 import { gpxZip, fileStamp } from './gpx.js';
 import { openCache } from './cache.js';
-import { fetchIdentify } from './osm.js';
+import { fetchIdentify, previewRule } from './osm.js';
 import {
   MAX_QUERY_RULES, MAX_RULES, TAG_FILTER_AS_QUERY, looksLikeTagFilter, parseTagFilter,
 } from './selection.js';
@@ -624,6 +624,7 @@ function applyGeometry(poly, op) {
     next = state.regions.concat([poly]);
   }
   state.regions = next;
+  dropAllPreviews();
   drawRegions();
   // A different area is a different question: the streets the editor was
   // drawing belong to the old one.
@@ -638,6 +639,7 @@ function applyGeometry(poly, op) {
 // is the only thing that does, so does what a reload would have come back to.
 function clearZones() {
   state.regions = [];
+  dropAllPreviews();
   drawRegions();
   dropBaseline();
   closeRoadCard();
@@ -769,6 +771,8 @@ const ident = {
   checked: new Set(),
   areas: [],         // the admin and cadastral areas the click lies in, most local first
   areaId: null,      // the one picked to limit the rule to, by Overpass area id
+  areaLayer: null,   // that area's outline on the map, while it is picked
+  areaSeq: 0,        // the pick the outline belongs to; older lookups are dropped
   at: null,
   seq: 0,            // the click the card belongs to; older answers are dropped
 };
@@ -1077,7 +1081,7 @@ function renderRules() {
       input.name = `rule-op-${i}`;
       input.value = value;
       input.checked = rule.op === value;
-      input.addEventListener('change', () => { rule.op = value; rulesChanged(); });
+      input.addEventListener('change', () => { rule.op = value; recolorPreview(rule); rulesChanged(); });
       const span = document.createElement('span');
       span.textContent = label;
       l.append(input, span);
@@ -1088,17 +1092,24 @@ function renderRules() {
     kind.textContent = RULE_KIND_LABEL[rule.kind];
     const meta = document.createElement('span');
     meta.className = 'rule-meta';
+    // Draws what this rule matches, so it can be checked before a compute.
+    const show = document.createElement('button');
+    show.type = 'button';
+    show.className = 'rule-show';
+    show.innerHTML = EYE_ICON;
+    show.addEventListener('click', () => togglePreview(rule));
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'rule-del';
     del.setAttribute('aria-label', `Delete rule ${i + 1}`);
     del.textContent = '×';
     del.addEventListener('click', () => {
+      dropPreview(rule);
       state.rules.splice(i, 1);
       renderRules();
       rulesChanged();
     });
-    head.append(ops, kind, meta, del);
+    head.append(ops, kind, meta, show, del);
 
     const text = document.createElement('textarea');
     text.rows = rule.kind === 'tags' ? 2 : 5;
@@ -1109,6 +1120,8 @@ function renderRules() {
     text.value = rule.text;
     text.addEventListener('input', () => {
       rule.text = text.value;
+      // What is drawn answers the old text; a new one has to ask again.
+      dropPreview(rule);
       validateRules();
       saveSession();       // debounced; a reload mid-sentence keeps the sentence
     });
@@ -1117,9 +1130,14 @@ function renderRules() {
     const error = document.createElement('p');
     error.className = 'rule-error';
 
-    card.append(head, text, error);
+    const preview = document.createElement('p');
+    preview.className = 'rule-preview';
+
+    card.append(head, text, error, preview);
+    card.ruleRef = rule;
     return card;
   }));
+  syncPreviewButtons();
   $('add-tag-rule').disabled = state.rules.length >= MAX_RULES;
   $('add-query-rule').disabled = state.rules.length >= MAX_RULES
     || state.rules.filter((r) => r.kind === 'overpass').length >= MAX_QUERY_RULES;
@@ -1151,6 +1169,128 @@ function syncRulesInfo() {
         + 'tracks, or service and private roads while Include service roads is off.'
       : 'Downloaded ways this rule matched, inside the zones or not.';
   });
+}
+
+/* Each rule's own matches, drawn on the map at the press of its eye, to test
+   the rule before a compute: in the selection cyan if it adds, the cut red if
+   it removes. From the same road download a compute of these zones would use
+   (see previewRule() in osm.js), so asking here also saves the compute the
+   download. With no zone drawn yet, the view stands in for one - if it is
+   small enough to download without a second thought.
+
+   A preview answers one question - this text, these zones, this road filter -
+   so changing any of them takes it away rather than leaving a stale answer on
+   the map. */
+const EYE_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/></svg>';
+const PREVIEW_PANE = 'rule-preview';
+map.createPane(PREVIEW_PANE).style.zIndex = '430';   // over the route, under Identify
+const previewRenderer = L.canvas({ pane: PREVIEW_PANE, padding: 0.2 });
+const PREVIEW_VIEW_MAX_KM2 = 25;
+
+const previews = new Map();   // rule -> { state: 'loading' | 'shown' | 'error', layers, info, seq }
+let previewSeq = 0;
+
+const previewInk = (rule) => cssVar(rule.op === 'remove' ? '--cut' : '--ident');
+
+// The zones, or the view when there are none yet.
+function previewArea() {
+  if (state.regions.length) return Area.fromShape(shapePayload());
+  const b = map.getBounds();
+  const area = Area.fromShape({
+    type: 'polygon',
+    points: [[b.getSouth(), b.getWest()], [b.getSouth(), b.getEast()],
+             [b.getNorth(), b.getEast()], [b.getNorth(), b.getWest()]],
+  });
+  if (area.areaKm2() > PREVIEW_VIEW_MAX_KM2) {
+    throw new Error(`draw a zone first, or zoom in - the view is ${Math.round(area.areaKm2())} km², `
+      + `and without a zone the preview only downloads up to ${PREVIEW_VIEW_MAX_KM2}`);
+  }
+  return area;
+}
+
+// The eye's state and the line under the text, on every card, from `previews`.
+function syncPreviewButtons() {
+  $('rules').querySelectorAll('.rule').forEach((card) => {
+    const p = previews.get(card.ruleRef);
+    const show = card.querySelector('.rule-show');
+    show.classList.toggle('on', !!p && p.state === 'shown');
+    show.classList.toggle('busy', !!p && p.state === 'loading');
+    show.setAttribute('aria-pressed', String(!!p && p.state === 'shown'));
+    show.setAttribute('aria-label', p && p.state === 'shown' ? 'Hide what this rule matches' : 'Show what this rule matches on the map');
+    show.title = show.getAttribute('aria-label');
+    const line = card.querySelector('.rule-preview');
+    line.textContent = p ? p.info : '';
+    line.classList.toggle('bad', !!p && p.state === 'error');
+  });
+}
+
+function dropPreview(rule) {
+  const p = previews.get(rule);
+  if (!p) return;
+  for (const layer of p.layers || []) map.removeLayer(layer);
+  previews.delete(rule);
+  syncPreviewButtons();
+}
+
+function dropAllPreviews() {
+  for (const rule of [...previews.keys()]) dropPreview(rule);
+}
+
+function recolorPreview(rule) {
+  const p = previews.get(rule);
+  if (!p || !p.layers || p.layers.length < 3) return;
+  for (const layer of p.layers.slice(1)) layer.setStyle({ color: previewInk(rule) });
+}
+
+async function togglePreview(rule) {
+  if (previews.has(rule)) { dropPreview(rule); return; }
+  const problem = ruleProblem(rule);
+  const seq = ++previewSeq;
+  const entry = { state: 'loading', layers: [], info: 'Downloading roads...', seq };
+  previews.set(rule, entry);
+  syncPreviewButtons();
+  if (problem) {
+    Object.assign(entry, { state: 'error', info: 'Fix the rule first.' });
+    syncPreviewButtons();
+    return;
+  }
+  let found;
+  try {
+    const area = previewArea();
+    found = await previewRule(rule, area, {
+      includePrivate: includePrivate(),
+      cache: await sessionCache(),
+      progress: (phase, message) => {
+        if (previews.get(rule) !== entry) return;
+        entry.info = message.includes('retrying') ? 'OpenStreetMap is busy - retrying...' : entry.info;
+        syncPreviewButtons();
+      },
+    });
+  } catch (err) {
+    if (previews.get(rule) !== entry) return;     // hidden, edited or replaced meanwhile
+    Object.assign(entry, { state: 'error', info: friendlyError(err.message) });
+    syncPreviewButtons();
+    return;
+  }
+  if (previews.get(rule) !== entry) return;
+  // Inside the zones: haloed and solid, since those are the ones that count.
+  // Beyond them, in the rest of the download: thin and faint. Index 1 is the
+  // solid line recolorPreview() repaints, 2 its faint counterpart.
+  const ink = previewInk(rule);
+  const line = (lines, style) => L.polyline(lines, { renderer: previewRenderer, interactive: false, ...style });
+  entry.layers = [
+    line(found.inside, { color: cssVar('--map-bg'), weight: 7, opacity: 0.85 }),
+    line(found.inside, { color: ink, weight: 3.5, opacity: 1 }),
+    line(found.outside, { color: ink, weight: 2, opacity: 0.35 }),
+  ];
+  for (const layer of entry.layers) layer.addTo(map);
+  entry.state = 'shown';
+  const zone = state.regions.length ? 'the zones' : 'the view';
+  const n = found.inside.length;
+  entry.info = `${n} ${n === 1 ? 'way' : 'ways'} in ${zone}`
+    + (found.outside.length ? `, ${found.outside.length} more around (faint)` : '')
+    + (found.missing ? ` · ${found.missing} the query returned are not drivable roads` : '');
+  syncPreviewButtons();
 }
 
 function rulesChanged() {
@@ -1223,6 +1363,8 @@ function runCheck() {
  'private-roads'].forEach((id) => {
   $(id).addEventListener('change', () => {
     if (id === 'session-enabled') syncSessionField();
+    // Service roads in or out is a different download to match against.
+    if (id === 'private-roads') dropAllPreviews();
     // A different question gives a different set of streets, so what the editor
     // has been drawing from is no longer what "everything" looks like.
     dropBaseline();
@@ -1436,6 +1578,7 @@ function restoreRoute(meta, { fit = true } = {}) {
   clearRoute();
   state.regions = Array.isArray(view.regions) ? view.regions : [];
   state.fixes = (form.fixes && typeof form.fixes === 'object') ? { ...form.fixes } : {};
+  dropAllPreviews();
   state.rules = cleanRules(form.selection);
   renderRules();
   drawRegions();
@@ -1793,8 +1936,15 @@ const filterClause = (key, value) => `[${quoteTag(key)}=${quoteTag(value)}]`;
 // The area the card has picked, or null.
 const identArea = () => ident.areas.find((a) => a.id === ident.areaId) || null;
 
-const areaLevel = (a) => (a.tags.boundary === 'cadastral' ? 'cadastral'
-  : a.tags.admin_level ? `admin_level ${a.tags.admin_level}` : a.tags.boundary);
+// What kind of area it is, in the tags that make it one.
+function areaLevel(a) {
+  const t = a.tags;
+  if (t.boundary === 'cadastral') return 'cadastral';
+  if (t.boundary === 'administrative' && t.admin_level) return `admin_level ${t.admin_level}`;
+  if (t.landuse) return `landuse=${t.landuse}`;
+  if (t.place) return `place=${t.place}`;
+  return t.boundary || '';
+}
 
 /* What the card's ticks and pick add up to, as a Required roads rule. Ticks
    alone are a tag filter; an area makes it a query limited to that area, since
@@ -1823,7 +1973,7 @@ function identifyCard(body) {
       className: 'road-popup ident-popup', closeButton: true, autoClose: false,
       closeOnClick: false, maxWidth: 340, minWidth: 260,
     });
-    ident.popup.on('remove', clearIdentifyHighlight);
+    ident.popup.on('remove', () => { clearIdentifyHighlight(); clearAreaOutline(); ident.areaSeq++; });
   }
   /* Leaflet pans the map so the card fits, but it only knows the map's edges,
      and the tool bar floats over the top of it. Measured each time, since the
@@ -1868,7 +2018,9 @@ function drawIdentifyHighlight(way) {
 
 function closeIdentify() {
   ident.seq++;
+  ident.areaSeq++;
   clearIdentifyHighlight();
+  clearAreaOutline();
   if (ident.popup && map.hasLayer(ident.popup)) map.closePopup(ident.popup);
 }
 
@@ -1898,7 +2050,7 @@ function renderIdentify() {
   const areas = ident.areas.length
     ? '<div class="ident-section">Inside</div><div class="ident-areas">'
       + areaRow('', 'Anywhere', 'no area', null)
-      + ident.areas.map((a) => areaRow(a.id, a.tags.name, areaLevel(a), osmAreaUrl(a.id))).join('')
+      + ident.areas.map((a) => areaRow(a.id, a.tags.name, areaLevel(a), osmAreaUrl(a))).join('')
       + '</div>'
     : '';
 
@@ -1926,17 +2078,19 @@ function renderIdentify() {
       + ` href="https://www.openstreetmap.org/way/${way.id}">Open in OpenStreetMap</a>` : ''));
 }
 
-// An Overpass area id back to the OSM object it was made from.
-function osmAreaUrl(areaId) {
-  if (areaId >= 3600000000) return `https://www.openstreetmap.org/relation/${areaId - 3600000000}`;
-  if (areaId >= 2400000000) return `https://www.openstreetmap.org/way/${areaId - 2400000000}`;
-  return null;
-}
+// The OSM object an area was made from.
+const osmAreaUrl = (a) => `https://www.openstreetmap.org/${a.osmType}/${a.osmId}`;
 
-// The outline of an area the card knows by id, as a zone. By id rather than by
-// name, so it is the very area clicked. Nominatim, as the boundary field uses.
-async function lookupAreaOutline(areaId) {
-  const ref = areaId >= 3600000000 ? `R${areaId - 3600000000}` : `W${areaId - 2400000000}`;
+/* The outline of an area the card lists, as polygon-clipping's multipolygon:
+   for drawing it while it is picked, and for Add as zone. By OSM id rather
+   than by name, so it is the very area clicked. Nominatim, as the boundary
+   field uses, which assembles a relation's rings; kept per area, since picking
+   back and forth between two should not ask twice. */
+const areaOutlines = new Map();
+
+async function lookupAreaOutline(area) {
+  if (areaOutlines.has(area.id)) return areaOutlines.get(area.id);
+  const ref = `${area.osmType === 'relation' ? 'R' : 'W'}${area.osmId}`;
   const url = `https://nominatim.openstreetmap.org/lookup?format=jsonv2&polygon_geojson=1`
     + `&polygon_threshold=${BOUNDARY_THRESHOLD_DEG}&osm_ids=${ref}`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
@@ -1944,7 +2098,36 @@ async function lookupAreaOutline(areaId) {
   const hit = (await res.json())[0];
   const g = hit && hit.geojson;
   if (!g || (g.type !== 'Polygon' && g.type !== 'MultiPolygon')) throw new Error('Nominatim has no outline for it');
-  return g.type === 'Polygon' ? [g.coordinates] : g.coordinates;
+  const poly = g.type === 'Polygon' ? [g.coordinates] : g.coordinates;
+  areaOutlines.set(area.id, poly);
+  return poly;
+}
+
+function clearAreaOutline() {
+  if (ident.areaLayer) { map.removeLayer(ident.areaLayer); ident.areaLayer = null; }
+}
+
+/* The picked area drawn on the map, so what the query will be limited to can
+   be checked before it is used: dashed in the selection cyan, faintly filled,
+   under the road highlight. Not fitted to - the card is anchored where the
+   click was, and a city's outline would pan it out of sight. */
+async function showAreaOutline(area) {
+  const seq = ++ident.areaSeq;
+  clearAreaOutline();
+  if (!area) return;
+  let poly;
+  try {
+    poly = await lookupAreaOutline(area);
+  } catch (err) {
+    console.warn(`no outline for ${area.tags.name}:`, err.message);
+    return;
+  }
+  if (seq !== ident.areaSeq || ident.areaId !== area.id) return;   // picked another meanwhile
+  ident.areaLayer = L.polygon(poly.map((rings) => rings.map((ring) => ring.map(([x, y]) => [y, x]))), {
+    pane: IDENT_PANE, interactive: false,
+    color: cssVar('--ident'), weight: 2.5, dashArray: '7,5', fillColor: cssVar('--ident'), fillOpacity: 0.08,
+  }).addTo(map);
+  ident.areaLayer.bringToBack();
 }
 
 async function identifyAt(latlng) {
@@ -1970,6 +2153,8 @@ async function identifyAt(latlng) {
   ident.areas = found.areas;
   // Like the ticks, the pick survives the next click - while it still applies.
   if (!ident.areas.some((a) => a.id === ident.areaId)) ident.areaId = null;
+  if (ident.areaId === null) clearAreaOutline();
+  else if (!ident.areaLayer) showAreaOutline(identArea());
   if (!ident.ways.length && !ident.areas.length) {
     identifyCard('<div class="road-card-meta">Nothing in OpenStreetMap here - click closer to a road.</div>');
     return;
@@ -1996,6 +2181,7 @@ function onIdentifyChange(ev) {
   if (pick) {
     ident.areaId = pick.value ? Number(pick.value) : null;
     renderIdentify();
+    showAreaOutline(identArea());
     return;
   }
   const box = ev.target.closest('.ident-card input[type=checkbox]');
@@ -2025,7 +2211,7 @@ async function onIdentifyClick(ev) {
     act.disabled = true;
     act.textContent = 'Adding...';
     try {
-      applyGeometry(await lookupAreaOutline(area.id), 'add');
+      applyGeometry(await lookupAreaOutline(area), 'add');
       done('Added');
     } catch (err) {
       showMapAlert(`Could not add ${area.tags.name} as a zone: ${err.message}.`);
