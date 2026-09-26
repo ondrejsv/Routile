@@ -5,6 +5,7 @@ import { Area } from './area.js';
 import { DetailLayer } from './detail.js';
 import { gpxZip, fileStamp } from './gpx.js';
 import { openCache } from './cache.js';
+import { fetchWaysNear } from './osm.js';
 import {
   MAX_QUERY_RULES, MAX_RULES, TAG_FILTER_AS_QUERY, looksLikeTagFilter, parseTagFilter,
 } from './selection.js';
@@ -758,9 +759,21 @@ function syncClear() {
   if (empty && $('op-subtract').checked) $('op-add').checked = true;
 }
 
+// The Identify tool's card, here rather than with the tool because setMode()
+// below puts it away and runs before the rest of the script does.
+const ident = {
+  popup: null,
+  highlight: null,
+  ways: [],          // nearest first
+  index: 0,          // which of them the card is showing
+  checked: new Set(),
+  at: null,
+  seq: 0,            // the click the card belongs to; older answers are dropped
+};
+
 const TOOL_BUTTONS = {
   select: 'mode-select', pan: 'mode-pan', rect: 'mode-rect', circle: 'mode-circle',
-  freehand: 'mode-freehand', pin: 'mode-pin',
+  freehand: 'mode-freehand', pin: 'mode-pin', identify: 'mode-identify',
 };
 
 function setMode(mode) {
@@ -777,6 +790,10 @@ function setMode(mode) {
   mapEl.classList.toggle('drawing', drawing);
   mapEl.classList.toggle('pinning', mode === 'pin');
   mapEl.classList.toggle('selecting', mode === 'select');
+  mapEl.classList.toggle('identifying', mode === 'identify');
+  // Leaving the tool puts its card away - but not for the pan grip, which
+  // leaves and comes back on every middle-button drag.
+  if (!tempPan && mode !== 'identify') closeIdentify();
   /* Arming Edit coverage is what opens the editor, so the map's answer to the
      tool change is the editor's too - except under the pan grip, which leaves
      and re-enters the tool on every drag without the user asking for either.
@@ -1620,6 +1637,7 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape') return;
   hideMapAlert();
   hideTip();
+  closeIdentify();
   // The street card has no close button of its own, so this and a click off the
   // street are the two ways to put it away.
   closeRoadCard();
@@ -1732,6 +1750,214 @@ for (const type of ['dragover', 'drop']) {
   window.addEventListener(type, (ev) => {
     if (!dropzone.contains(ev.target)) ev.preventDefault();
   });
+}
+
+/* --------------------------------------------------------------- identify */
+/* Click a road, read what OSM says about it - the raw material of a tag filter,
+   which is otherwise guessed at from the wiki. Asked of Overpass on each click
+   rather than of the road download: this works before anything is computed,
+   and it shows footways and tracks too, the things a filter is often written
+   to leave out.
+
+   The card lists every tag with a box beside it; ticking boxes writes the
+   filter below them, which can be copied or added straight to Required roads.
+   The ticks carry over from one road to the next, so the same filter can be
+   tried street after street. */
+const IDENTIFY_PX = 12;            // how far from the click a road may lie
+const IDENTIFY_RADIUS_M = [3, 80]; // clamped: zoomed far out, 12 px is a suburb
+
+const wayLabel = (w) => w.tags?.name || w.tags?.ref || w.tags?.highway || `way ${w.id}`;
+
+// Metres from a point to a way's geometry, flat-earth: at these distances the
+// curvature is far below a pixel.
+function distanceToWay(at, geometry) {
+  const kx = 111320 * Math.cos(at.lat * Math.PI / 180), ky = 110540;
+  const pts = geometry.map((g) => [(g.lon - at.lng) * kx, (g.lat - at.lat) * ky]);
+  let best = pts.length ? Math.hypot(pts[0][0], pts[0][1]) : Infinity;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [ax, ay] = pts[i], [bx, by] = pts[i + 1];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 > 0 ? Math.min(Math.max(-(ax * dx + ay * dy) / len2, 0), 1) : 0;
+    best = Math.min(best, Math.hypot(ax + t * dx, ay + t * dy));
+  }
+  return best;
+}
+
+// One clause of an Overpass tag filter, quoted so any key or value survives.
+const quoteTag = (s) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+const filterClause = (key, value) => `[${quoteTag(key)}=${quoteTag(value)}]`;
+
+function identifyFilter() {
+  const way = ident.ways[ident.index];
+  if (!way) return '';
+  return Object.keys(way.tags || {}).sort()
+    .filter((k) => ident.checked.has(k))
+    .map((k) => filterClause(k, way.tags[k])).join('');
+}
+
+function identifyCard(body) {
+  if (!ident.popup) {
+    ident.popup = L.popup({
+      className: 'road-popup ident-popup', closeButton: true, autoClose: false,
+      closeOnClick: false, maxWidth: 340, minWidth: 260,
+    });
+    ident.popup.on('remove', clearIdentifyHighlight);
+  }
+  /* Leaflet pans the map so the card fits, but it only knows the map's edges,
+     and the tool bar floats over the top of it. Measured each time, since the
+     bar moves as the window narrows. */
+  const mapTop = mapEl.getBoundingClientRect().top;
+  const barBottom = $('topbar').getBoundingClientRect().bottom - mapTop;
+  ident.popup.options.autoPanPaddingTopLeft = L.point(16, Math.max(barBottom, 0) + 12);
+  ident.popup.options.autoPanPaddingBottomRight = L.point(16, 16);
+  ident.popup.setLatLng(ident.at).setContent(`<div class="road-card ident-card">${body}</div>`);
+  if (!map.hasLayer(ident.popup)) ident.popup.openOn(map);
+  wireIdentifyCard(ident.popup.getElement());
+}
+
+function clearIdentifyHighlight() {
+  if (ident.highlight) { map.removeLayer(ident.highlight); ident.highlight = null; }
+}
+
+/* The whole way, end to end, as OSM has it - not just where it was clicked,
+   since one way is often a short stretch of a longer street and where it stops
+   is what a filter on it will select. Drawn over everything: a halo in the
+   map's own ground colour, the line in the selection cyan, and a dot at each
+   end so its extent reads even where it runs on under the route. */
+// Its own pane, above the route and the editor's streets (overlays sit at 400)
+// and below the markers and the card.
+const IDENT_PANE = 'identify';
+map.createPane(IDENT_PANE).style.zIndex = '450';
+
+function drawIdentifyHighlight(way) {
+  clearIdentifyHighlight();
+  const line = way.geometry.map((g) => [g.lat, g.lon]);
+  const halo = cssVar('--map-bg'), ink = cssVar('--ident');
+  const style = { pane: IDENT_PANE, interactive: false };
+  const ends = [line[0], line[line.length - 1]].map((p) => L.circleMarker(p, {
+    ...style, radius: 5, color: halo, weight: 2, fillColor: ink, fillOpacity: 1,
+  }));
+  ident.highlight = L.layerGroup([
+    L.polyline(line, { ...style, color: halo, weight: 11, opacity: 0.9 }),
+    L.polyline(line, { ...style, color: ink, weight: 6, opacity: 1 }),
+    ...ends,
+  ]).addTo(map);
+}
+
+function closeIdentify() {
+  ident.seq++;
+  clearIdentifyHighlight();
+  if (ident.popup && map.hasLayer(ident.popup)) map.closePopup(ident.popup);
+}
+
+function renderIdentify() {
+  const way = ident.ways[ident.index];
+  drawIdentifyHighlight(way);
+
+  const tags = way.tags || {};
+  const rows = Object.keys(tags).sort().map((k) =>
+    '<label class="ident-tag">'
+    + `<input type="checkbox" data-key="${escapeHtml(k)}"${ident.checked.has(k) ? ' checked' : ''}>`
+    + `<span class="ident-k">${escapeHtml(k)}</span>`
+    + `<span class="ident-v">${escapeHtml(String(tags[k]))}</span></label>`).join('');
+  const others = ident.ways.length > 1
+    ? '<div class="ident-others"><span>Also here:</span>'
+      + ident.ways.map((w, i) => (i === ident.index ? ''
+        : `<button type="button" class="ident-other" data-i="${i}">${escapeHtml(wayLabel(w))}</button>`)).join('')
+      + '</div>'
+    : '';
+  const filter = identifyFilter();
+  const off = filter ? '' : ' disabled';
+  identifyCard(
+    `<div class="road-card-name">${escapeHtml(wayLabel(way))}</div>`
+    + `<div class="road-card-meta">way ${way.id} · ${Object.keys(tags).length} tags</div>`
+    + `<div class="ident-tags">${rows}</div>`
+    + '<div class="ident-filter-label">Tick tags to build a filter</div>'
+    + `<code class="ident-filter">${filter ? escapeHtml(filter) : '&nbsp;'}</code>`
+    + '<div class="rule-adders ident-actions">'
+    + `<button type="button" class="ghost" data-act="copy"${off}>Copy filter</button>`
+    + `<button type="button" class="ghost" data-act="rule"${off}>Add as rule</button>`
+    + '</div>'
+    + others
+    + '<a class="road-card-link" target="_blank" rel="noopener noreferrer"'
+    + ` href="https://www.openstreetmap.org/way/${way.id}">Open in OpenStreetMap</a>`);
+}
+
+async function identifyAt(latlng) {
+  const seq = ++ident.seq;
+  ident.at = latlng;
+  clearIdentifyHighlight();
+  identifyCard('<div class="road-card-meta">Looking up roads here...</div>');
+  const px = map.latLngToContainerPoint(latlng);
+  const edge = map.containerPointToLatLng(px.add([IDENTIFY_PX, 0]));
+  const radius = Math.min(Math.max(latlng.distanceTo(edge), IDENTIFY_RADIUS_M[0]), IDENTIFY_RADIUS_M[1]);
+  let ways;
+  try {
+    ways = await fetchWaysNear(latlng.lat, latlng.lng, radius);
+  } catch (err) {
+    if (seq === ident.seq) identifyCard(`<div class="road-card-meta">${escapeHtml(err.message)}</div>`);
+    return;
+  }
+  if (seq !== ident.seq) return;         // another click, or the tool was put away
+  if (!ways.length) {
+    identifyCard('<div class="road-card-meta">No road in OpenStreetMap here - click closer to one.</div>');
+    return;
+  }
+  ident.ways = ways
+    .map((w) => ({ w, d: distanceToWay(latlng, w.geometry) }))
+    .sort((a, b) => a.d - b.d).map((x) => x.w);
+  ident.index = 0;
+  renderIdentify();
+}
+
+map.on('click', (ev) => {
+  if (state.mode === 'identify') identifyAt(ev.latlng);
+});
+
+/* On the popup's own element, which Leaflet keeps across setContent(), and
+   delegated, since the markup inside is rebuilt on every change. Not on the
+   map: Leaflet stops clicks inside a popup from reaching it. */
+function wireIdentifyCard(el) {
+  if (!el || el.dataset.wired) return;
+  el.dataset.wired = '1';
+  el.addEventListener('change', onIdentifyChange);
+  el.addEventListener('click', onIdentifyClick);
+}
+
+function onIdentifyChange(ev) {
+  const box = ev.target.closest('.ident-card input[type=checkbox]');
+  if (!box) return;
+  if (box.checked) ident.checked.add(box.dataset.key); else ident.checked.delete(box.dataset.key);
+  renderIdentify();
+}
+
+async function onIdentifyClick(ev) {
+  const other = ev.target.closest('.ident-card .ident-other');
+  if (other) {
+    ident.index = Number(other.dataset.i);
+    renderIdentify();
+    return;
+  }
+  const act = ev.target.closest('.ident-card [data-act]');
+  const filter = identifyFilter();
+  if (!act || !filter) return;
+  const label = act.textContent;
+  if (act.dataset.act === 'copy') {
+    try {
+      await navigator.clipboard.writeText(filter);
+      act.textContent = 'Copied';
+    } catch (err) {
+      act.textContent = 'Copy failed';
+    }
+  } else {
+    state.rules.push({ op: 'add', kind: 'tags', text: filter });
+    renderRules();
+    rulesChanged();
+    act.textContent = 'Added';
+    $('rules-block').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+  setTimeout(() => { if (act.isConnected) act.textContent = label; }, 1400);
 }
 
 /* ---------------------------------------------------------------- render */

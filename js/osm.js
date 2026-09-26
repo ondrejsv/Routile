@@ -172,6 +172,28 @@ export async function fetchOverpass(box, { profile, cache = null, progress = nul
   );
 }
 
+/* The drivable-looking ways within `radiusM` of a point, tags and geometry, for
+   the map's Identify tool. Any highway=* at all, not just what the road filter
+   downloads: the point is to see what OSM says, footway or not. Two tries, not
+   four - someone is waiting on a click. */
+export async function fetchWaysNear(lat, lon, radiusM) {
+  const query = `[out:json][timeout:25];way(around:${Math.round(radiusM)},`
+    + `${lat.toFixed(6)},${lon.toFixed(6)})["highway"];out tags geom;`;
+  let last = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const endpoint = config.OVERPASS_ENDPOINTS[attempt % config.OVERPASS_ENDPOINTS.length];
+    try {
+      const json = await postQuery(endpoint, query);
+      if (json.remark && /error/i.test(json.remark)) throw new Error(json.remark);
+      return (json.elements || []).filter((el) => el.type === 'way' && Array.isArray(el.geometry));
+    } catch (err) {
+      last = err;
+      if (attempt === 0) await sleep(config.OVERPASS_RETRY_DELAY_MS);
+    }
+  }
+  throw new FetchError(`OpenStreetMap did not answer (${last ? last.message : 'no response'}) - try again in a moment`);
+}
+
 /* The way ids one of the user's selection queries returns, cached like the road
    download and keyed by the full query text, which carries the box. An empty
    answer is an answer here, not a failure: the rule simply selects nothing, and
