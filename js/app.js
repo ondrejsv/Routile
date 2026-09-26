@@ -5,7 +5,7 @@ import { Area } from './area.js';
 import { DetailLayer } from './detail.js';
 import { gpxZip, fileStamp } from './gpx.js';
 import { openCache } from './cache.js';
-import { fetchWaysNear } from './osm.js';
+import { fetchIdentify } from './osm.js';
 import {
   MAX_QUERY_RULES, MAX_RULES, TAG_FILTER_AS_QUERY, looksLikeTagFilter, parseTagFilter,
 } from './selection.js';
@@ -767,6 +767,8 @@ const ident = {
   ways: [],          // nearest first
   index: 0,          // which of them the card is showing
   checked: new Set(),
+  areas: [],         // the admin and cadastral areas the click lies in, most local first
+  areaId: null,      // the one picked to limit the rule to, by Overpass area id
   at: null,
   seq: 0,            // the click the card belongs to; older answers are dropped
 };
@@ -1788,12 +1790,31 @@ function distanceToWay(at, geometry) {
 const quoteTag = (s) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 const filterClause = (key, value) => `[${quoteTag(key)}=${quoteTag(value)}]`;
 
-function identifyFilter() {
+// The area the card has picked, or null.
+const identArea = () => ident.areas.find((a) => a.id === ident.areaId) || null;
+
+const areaLevel = (a) => (a.tags.boundary === 'cadastral' ? 'cadastral'
+  : a.tags.admin_level ? `admin_level ${a.tags.admin_level}` : a.tags.boundary);
+
+/* What the card's ticks and pick add up to, as a Required roads rule. Ticks
+   alone are a tag filter; an area makes it a query limited to that area, since
+   lying in a borough is not a tag a road carries. The area goes in by id, not by
+   name: it is the exact one clicked, and there is no Nominatim lookup to go
+   wrong. No ticks with an area picked means every road in it. */
+function identifyRule() {
   const way = ident.ways[ident.index];
-  if (!way) return '';
-  return Object.keys(way.tags || {}).sort()
+  const clauses = way ? Object.keys(way.tags || {}).sort()
     .filter((k) => ident.checked.has(k))
-    .map((k) => filterClause(k, way.tags[k])).join('');
+    .map((k) => filterClause(k, way.tags[k])).join('') : '';
+  const area = identArea();
+  if (area) {
+    return {
+      kind: 'overpass',
+      text: `// ${area.tags.name.replace(/[\r\n]/g, ' ')} (${areaLevel(area)})\n`
+        + `area(id:${area.id})->.a;\nway(area.a)${clauses || '["highway"]'};`,
+    };
+  }
+  return clauses ? { kind: 'tags', text: clauses } : null;
 }
 
 function identifyCard(body) {
@@ -1852,10 +1873,10 @@ function closeIdentify() {
 }
 
 function renderIdentify() {
-  const way = ident.ways[ident.index];
-  drawIdentifyHighlight(way);
+  const way = ident.ways[ident.index] || null;
+  if (way) drawIdentifyHighlight(way); else clearIdentifyHighlight();
 
-  const tags = way.tags || {};
+  const tags = way ? way.tags || {} : {};
   const rows = Object.keys(tags).sort().map((k) =>
     '<label class="ident-tag">'
     + `<input type="checkbox" data-key="${escapeHtml(k)}"${ident.checked.has(k) ? ' checked' : ''}>`
@@ -1867,21 +1888,63 @@ function renderIdentify() {
         : `<button type="button" class="ident-other" data-i="${i}">${escapeHtml(wayLabel(w))}</button>`)).join('')
       + '</div>'
     : '';
-  const filter = identifyFilter();
-  const off = filter ? '' : ' disabled';
+  // Most local first. The first row takes the area back out of the rule.
+  const areaRow = (id, name, level, href) => '<label class="ident-area">'
+    + `<input type="radio" name="ident-area" value="${id}"${(ident.areaId ?? '') === id ? ' checked' : ''}>`
+    + `<span class="ident-area-name">${escapeHtml(name)}</span>`
+    + `<span class="ident-area-level">${escapeHtml(level)}</span>`
+    + (href ? `<a class="ident-area-link" href="${href}" target="_blank" rel="noopener noreferrer" title="Open in OpenStreetMap">↗</a>` : '')
+    + '</label>';
+  const areas = ident.areas.length
+    ? '<div class="ident-section">Inside</div><div class="ident-areas">'
+      + areaRow('', 'Anywhere', 'no area', null)
+      + ident.areas.map((a) => areaRow(a.id, a.tags.name, areaLevel(a), osmAreaUrl(a.id))).join('')
+      + '</div>'
+    : '';
+
+  const rule = identifyRule();
+  const off = rule ? '' : ' disabled';
+  const what = rule && rule.kind === 'overpass' ? 'query' : 'filter';
   identifyCard(
-    `<div class="road-card-name">${escapeHtml(wayLabel(way))}</div>`
-    + `<div class="road-card-meta">way ${way.id} · ${Object.keys(tags).length} tags</div>`
-    + `<div class="ident-tags">${rows}</div>`
-    + '<div class="ident-filter-label">Tick tags to build a filter</div>'
-    + `<code class="ident-filter">${filter ? escapeHtml(filter) : '&nbsp;'}</code>`
+    (way
+      ? `<div class="road-card-name">${escapeHtml(wayLabel(way))}</div>`
+        + `<div class="road-card-meta">way ${way.id} · ${Object.keys(tags).length} tags</div>`
+        + `<div class="ident-tags">${rows}</div>`
+      : '<div class="road-card-name">No road here</div>'
+        + '<div class="road-card-meta">Click closer to one for its tags.</div>')
+    + areas
+    + `<div class="ident-filter-label">${way ? 'Tick tags to build a filter' : 'Pick an area to build a query'}`
+    + `${ident.areas.length && way ? ', pick an area to limit it to one' : ''}</div>`
+    + `<code class="ident-filter">${rule ? escapeHtml(rule.text) : '&nbsp;'}</code>`
     + '<div class="rule-adders ident-actions">'
-    + `<button type="button" class="ghost" data-act="copy"${off}>Copy filter</button>`
+    + `<button type="button" class="ghost" data-act="copy"${off}>Copy ${what}</button>`
     + `<button type="button" class="ghost" data-act="rule"${off}>Add as rule</button>`
+    + (identArea() ? '<button type="button" class="ghost" data-act="zone">Add as zone</button>' : '')
     + '</div>'
     + others
-    + '<a class="road-card-link" target="_blank" rel="noopener noreferrer"'
-    + ` href="https://www.openstreetmap.org/way/${way.id}">Open in OpenStreetMap</a>`);
+    + (way ? '<a class="road-card-link" target="_blank" rel="noopener noreferrer"'
+      + ` href="https://www.openstreetmap.org/way/${way.id}">Open in OpenStreetMap</a>` : ''));
+}
+
+// An Overpass area id back to the OSM object it was made from.
+function osmAreaUrl(areaId) {
+  if (areaId >= 3600000000) return `https://www.openstreetmap.org/relation/${areaId - 3600000000}`;
+  if (areaId >= 2400000000) return `https://www.openstreetmap.org/way/${areaId - 2400000000}`;
+  return null;
+}
+
+// The outline of an area the card knows by id, as a zone. By id rather than by
+// name, so it is the very area clicked. Nominatim, as the boundary field uses.
+async function lookupAreaOutline(areaId) {
+  const ref = areaId >= 3600000000 ? `R${areaId - 3600000000}` : `W${areaId - 2400000000}`;
+  const url = `https://nominatim.openstreetmap.org/lookup?format=jsonv2&polygon_geojson=1`
+    + `&polygon_threshold=${BOUNDARY_THRESHOLD_DEG}&osm_ids=${ref}`;
+  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error(`the geocoder answered ${res.status}`);
+  const hit = (await res.json())[0];
+  const g = hit && hit.geojson;
+  if (!g || (g.type !== 'Polygon' && g.type !== 'MultiPolygon')) throw new Error('Nominatim has no outline for it');
+  return g.type === 'Polygon' ? [g.coordinates] : g.coordinates;
 }
 
 async function identifyAt(latlng) {
@@ -1892,22 +1955,25 @@ async function identifyAt(latlng) {
   const px = map.latLngToContainerPoint(latlng);
   const edge = map.containerPointToLatLng(px.add([IDENTIFY_PX, 0]));
   const radius = Math.min(Math.max(latlng.distanceTo(edge), IDENTIFY_RADIUS_M[0]), IDENTIFY_RADIUS_M[1]);
-  let ways;
+  let found;
   try {
-    ways = await fetchWaysNear(latlng.lat, latlng.lng, radius);
+    found = await fetchIdentify(latlng.lat, latlng.lng, radius);
   } catch (err) {
     if (seq === ident.seq) identifyCard(`<div class="road-card-meta">${escapeHtml(err.message)}</div>`);
     return;
   }
   if (seq !== ident.seq) return;         // another click, or the tool was put away
-  if (!ways.length) {
-    identifyCard('<div class="road-card-meta">No road in OpenStreetMap here - click closer to one.</div>');
-    return;
-  }
-  ident.ways = ways
+  ident.ways = found.ways
     .map((w) => ({ w, d: distanceToWay(latlng, w.geometry) }))
     .sort((a, b) => a.d - b.d).map((x) => x.w);
   ident.index = 0;
+  ident.areas = found.areas;
+  // Like the ticks, the pick survives the next click - while it still applies.
+  if (!ident.areas.some((a) => a.id === ident.areaId)) ident.areaId = null;
+  if (!ident.ways.length && !ident.areas.length) {
+    identifyCard('<div class="road-card-meta">Nothing in OpenStreetMap here - click closer to a road.</div>');
+    return;
+  }
   renderIdentify();
 }
 
@@ -1926,6 +1992,12 @@ function wireIdentifyCard(el) {
 }
 
 function onIdentifyChange(ev) {
+  const pick = ev.target.closest('.ident-card input[name="ident-area"]');
+  if (pick) {
+    ident.areaId = pick.value ? Number(pick.value) : null;
+    renderIdentify();
+    return;
+  }
   const box = ev.target.closest('.ident-card input[type=checkbox]');
   if (!box) return;
   if (box.checked) ident.checked.add(box.dataset.key); else ident.checked.delete(box.dataset.key);
@@ -1940,24 +2012,46 @@ async function onIdentifyClick(ev) {
     return;
   }
   const act = ev.target.closest('.ident-card [data-act]');
-  const filter = identifyFilter();
-  if (!act || !filter) return;
+  if (!act) return;
   const label = act.textContent;
+  const done = (text) => {
+    act.textContent = text;
+    setTimeout(() => { if (act.isConnected) act.textContent = label; }, 1400);
+  };
+
+  if (act.dataset.act === 'zone') {
+    const area = identArea();
+    if (!area || act.disabled) return;
+    act.disabled = true;
+    act.textContent = 'Adding...';
+    try {
+      applyGeometry(await lookupAreaOutline(area.id), 'add');
+      done('Added');
+    } catch (err) {
+      showMapAlert(`Could not add ${area.tags.name} as a zone: ${err.message}.`);
+      act.textContent = label;
+    } finally {
+      act.disabled = false;
+    }
+    return;
+  }
+
+  const rule = identifyRule();
+  if (!rule) return;
   if (act.dataset.act === 'copy') {
     try {
-      await navigator.clipboard.writeText(filter);
-      act.textContent = 'Copied';
+      await navigator.clipboard.writeText(rule.text);
+      done('Copied');
     } catch (err) {
-      act.textContent = 'Copy failed';
+      done('Copy failed');
     }
   } else {
-    state.rules.push({ op: 'add', kind: 'tags', text: filter });
+    state.rules.push({ op: 'add', ...rule });
     renderRules();
     rulesChanged();
-    act.textContent = 'Added';
+    done('Added');
     $('rules-block').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
-  setTimeout(() => { if (act.isConnected) act.textContent = label; }, 1400);
 }
 
 /* ---------------------------------------------------------------- render */

@@ -714,6 +714,30 @@ html, body {
 .ident-tag input { margin: 0; accent-color: var(--accent); align-self: center; }
 .ident-k { color: var(--ink-2); overflow-wrap: anywhere; }
 .ident-v { color: var(--ink); overflow-wrap: anywhere; }
+/* The areas the click lies in, one to pick. Name and level on one line, most
+   local first, the way an address reads. */
+.ident-section {
+  margin-top: 10px;
+  font-size: 10.5px; font-weight: 650; letter-spacing: 0.07em;
+  text-transform: uppercase; color: var(--ink-3);
+}
+.ident-areas {
+  margin-top: 4px; max-height: 170px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.ident-area {
+  display: grid; grid-template-columns: auto 1fr auto auto; gap: 7px;
+  align-items: center;
+  padding: 3px 8px; font-size: 12px; cursor: pointer;
+}
+.ident-area + .ident-area { border-top: 1px solid var(--line); }
+.ident-area:hover { background: var(--hover); }
+.ident-area input { margin: 0; accent-color: var(--accent); }
+.ident-area-name { color: var(--ink); overflow-wrap: anywhere; }
+.ident-area-level { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+.ident-area-link { color: var(--ink-3); text-decoration: none; font-size: 12px; }
+.ident-area-link:hover { color: var(--accent); }
+.ident-filter { white-space: pre-wrap; }
 .ident-filter-label { margin-top: 10px; font-size: 11px; color: var(--ink-3); }
 .ident-filter {
   display: block; margin-top: 3px; padding: 5px 8px; min-height: 26px;

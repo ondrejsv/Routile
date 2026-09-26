@@ -172,20 +172,37 @@ export async function fetchOverpass(box, { profile, cache = null, progress = nul
   );
 }
 
-/* The drivable-looking ways within `radiusM` of a point, tags and geometry, for
-   the map's Identify tool. Any highway=* at all, not just what the road filter
-   downloads: the point is to see what OSM says, footway or not. Two tries, not
-   four - someone is waiting on a click. */
-export async function fetchWaysNear(lat, lon, radiusM) {
-  const query = `[out:json][timeout:25];way(around:${Math.round(radiusM)},`
-    + `${lat.toFixed(6)},${lon.toFixed(6)})["highway"];out tags geom;`;
+/* What the map's Identify tool shows for a point, in one round trip:
+
+   * `ways` - every highway=* within `radiusM`, tags and geometry. Any highway
+     at all, not just what the road filter downloads: the point is to see what
+     OSM says, footway or not.
+   * `areas` - the administrative and cadastral areas the point lies in, from
+     the local part up to the country, most local first. An area's id is its
+     relation's plus 3600000000, which is what area(id:...) takes.
+
+   Two tries, not four - someone is waiting on a click. */
+export async function fetchIdentify(lat, lon, radiusM) {
+  const at = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+  const query = `[out:json][timeout:25];way(around:${Math.round(radiusM)},${at})["highway"];out tags geom;`
+    + `is_in(${at})->.in;area.in["boundary"~"^(administrative|cadastral)$"];out tags;`;
   let last = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     const endpoint = config.OVERPASS_ENDPOINTS[attempt % config.OVERPASS_ENDPOINTS.length];
     try {
       const json = await postQuery(endpoint, query);
       if (json.remark && /error/i.test(json.remark)) throw new Error(json.remark);
-      return (json.elements || []).filter((el) => el.type === 'way' && Array.isArray(el.geometry));
+      const elements = json.elements || [];
+      const level = (a) => {
+        // Cadastral areas carry no admin_level; they sit with the borough.
+        const n = parseInt(a.tags?.admin_level, 10);
+        return Number.isFinite(n) ? n : a.tags?.boundary === 'cadastral' ? 9.5 : 0;
+      };
+      return {
+        ways: elements.filter((el) => el.type === 'way' && Array.isArray(el.geometry)),
+        areas: elements.filter((el) => el.type === 'area' && el.tags?.name)
+          .sort((a, b) => level(b) - level(a)),
+      };
     } catch (err) {
       last = err;
       if (attempt === 0) await sleep(config.OVERPASS_RETRY_DELAY_MS);
