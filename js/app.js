@@ -1354,6 +1354,7 @@ function payload() {
     passes: passesValue() || 1,
     session_minutes: (sessionHours() || NO_SPLIT_HOURS) * 60,
     session_break: sessionBreak(),
+    return_home: $('return-home').checked,
     sessions_per_day: sessionsPerDay() || config.SESSIONS_PER_DAY_DEFAULT,
   };
   if (state.startLatLng) {
@@ -1386,7 +1387,7 @@ function runCheck() {
 }
 
 ['passes', 'session', 'dir-oneway', 'dir-both', 'session-enabled',
- 'private-roads', 'session-restaurant', 'sessions-per-day'].forEach((id) => {
+ 'private-roads', 'session-restaurant', 'sessions-per-day', 'return-home'].forEach((id) => {
   $(id).addEventListener('change', () => {
     if (id === 'session-enabled' || id === 'session-restaurant') syncSessionField();
     // Service roads in or out is a different download to match against.
@@ -1532,6 +1533,7 @@ function formState() {
     passes: passesValue() || 1,
     splitSessions: sessionEnabled(),
     breakAtRestaurant: $('session-restaurant').checked,
+    returnHome: $('return-home').checked,
     sessionsPerDay: sessionsPerDay() || config.SESSIONS_PER_DAY_DEFAULT,
     sessionHours: sessionHours() || NO_SPLIT_HOURS,
   };
@@ -1625,6 +1627,7 @@ function restoreRoute(meta, { fit = true } = {}) {
   // a recompute from here uses today's value.
   $('session-enabled').checked = !!form.splitSessions;
   $('session-restaurant').checked = !!form.breakAtRestaurant;
+  $('return-home').checked = !!form.returnHome;
   $('sessions-per-day').value = String(Math.min(Math.max(Math.round(form.sessionsPerDay) || config.SESSIONS_PER_DAY_DEFAULT, 2),
     config.SESSIONS_PER_DAY_MAX));
   const hours = Number(form.sessionHours);
@@ -2896,6 +2899,8 @@ map.on('click', (ev) => {
 
 function renderResult(res) {
   $('stats-card').classList.remove('hidden');
+  const notes = Array.isArray(res.notes) ? res.notes : [];
+  $('route-notes').textContent = notes.map((n) => n[0].toUpperCase() + n.slice(1) + '.').join(' ');
   // There is something to edit now, so the tool for it exists.
   $('mode-select').classList.remove('hidden');
   buildRoadIndex();
@@ -3081,7 +3086,17 @@ function sessionOf(item) {
   return item.dataset.session === 'all' ? null : Number(item.dataset.session);
 }
 
-function legendRow(key, color, name, km, minutes, then = '') {
+// The deadhead line under a row's figures: distance, time and its share of
+// the row's distance. Nothing for a route computed before sessions had it.
+function deadheadLine(km, deadKm, deadMinutes) {
+  if (!Number.isFinite(deadKm) || !Number.isFinite(deadMinutes)) return '';
+  const pct = km > 0 ? Math.round(100 * deadKm / km) : 0;
+  return `<span class="legend-dead" title="Driving that covers nothing: getting between streets, `
+    + `streets driven again, detours to breaks and trips home">`
+    + `deadhead ${pct}% · ${deadKm.toFixed(1)} km · ${humanMinutes(deadMinutes)}</span>`;
+}
+
+function legendRow(key, color, name, km, minutes, then = '', dead = null) {
   // The stripe is on every row, colourless on All sessions, so each label in
   // the list starts at the same place.
   return `<button type="button" class="legend-item${color ? '' : ' legend-all'}"`
@@ -3090,15 +3105,17 @@ function legendRow(key, color, name, km, minutes, then = '') {
     + '<span class="legend-text">'
     + `<span class="legend-name">${name}</span>`
     + `<span class="legend-meta">${Number(km).toFixed(1)} km · ${humanMinutes(minutes)}</span>`
+    + (dead ? deadheadLine(Number(km), dead.km, dead.minutes) : '')
     + (then ? `<span class="legend-stop">${escapeHtml(then)}</span>` : '')
     + '</span></button>';
 }
 
 // What comes after a session, under its figures: the restaurant its break is
-// at, or the end of the day, when sessions are joined into days.
+// at, home, or the end of the day, when sessions are joined into days.
 function sessionThen(sessions, stops, i) {
   const s = sessions[i];
   if (s.stop !== undefined && stops[s.stop]) return `then ${stops[s.stop].name}`;
+  if (s.home) return s.day !== undefined ? `end of day ${s.day + 1} · home` : 'back home';
   if (s.day === undefined) return '';
   const next = sessions[i + 1];
   return !next || next.day !== s.day ? `end of day ${s.day + 1}` : '';
@@ -3106,13 +3123,16 @@ function sessionThen(sessions, stops, i) {
 
 function buildLegend(sessions, stops = []) {
   const box = $('legend');
+  const deadOf = (s) => ({ km: Number(s.deadhead_km), minutes: Number(s.deadhead_minutes) });
   const rows = sessions.map((session, i) => legendRow(i, sessionColor(i), `Session ${i + 1}`,
-    session.km, session.minutes, sessionThen(sessions, stops, i)));
+    session.km, session.minutes, sessionThen(sessions, stops, i), deadOf(session)));
   // Totalled from the rows it sits above, so the sums agree with the list. One
   // session is already its own whole route, so the row would only repeat it.
   if (sessions.length > 1) {
     const sum = (field) => sessions.reduce((s, x) => s + (Number(x[field]) || 0), 0);
-    rows.unshift(legendRow('all', null, 'All sessions', sum('km'), sum('minutes')));
+    rows.unshift(legendRow('all', null, 'All sessions', sum('km'), sum('minutes'), '',
+      sessions.every((s) => s.deadhead_km !== undefined)
+        ? { km: sum('deadhead_km'), minutes: sum('deadhead_minutes') } : null));
   }
   box.innerHTML = rows.join('');
   box.classList.toggle('hidden', sessions.length === 0);

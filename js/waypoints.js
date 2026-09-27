@@ -25,8 +25,9 @@ import { circuitNodes } from './euler.js';
    a candidate O(1), so a leg costs one search however far it extends.
 
    `stops` are tour positions a waypoint must land on exactly - where one
-   session ends and the next begins - each { position, name, stop }: `stop`
-   is the index of the place stopped at, or undefined for a plain cut. No leg
+   session ends and the next begins - each { position, name, stop, home }:
+   `stop` is the index of the place stopped at, `home` marks a trip home, and
+   neither is a plain cut. No leg
    runs past one, and the waypoint sits on the node itself rather than along
    the arc before it, since that node is the destination. */
 export function reduceTour(g, circuit, { maxLegMetres, maxLegArcs, cutoffSeconds, margin, scale,
@@ -117,7 +118,7 @@ export function reduceTour(g, circuit, { maxLegMetres, maxLegArcs, cutoffSeconds
       // A break: on the node itself, named for the place if it is a stop and
       // for the street if it is a plain cut between sessions.
       const b = breaks[nextBreak];
-      mark = b.stop !== undefined ? { stop: b.stop } : { cut: true };
+      mark = b.stop !== undefined ? { stop: b.stop } : b.home ? { cut: true, home: true } : { cut: true };
       lon = g.x[nodes[j]]; lat = g.y[nodes[j]];
       street = b.name || g.streetName(arc);
     } else if (j === m) {

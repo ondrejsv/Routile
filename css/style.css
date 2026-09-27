@@ -723,6 +723,16 @@ html, body {
   stroke-linecap: round; stroke-linejoin: round;
 }
 .stop-card .stop-fact { margin-top: 3px; font-size: 12px; color: var(--ink-2); }
+/* Wraps rather than ellipses: the share at its end is the figure most worth
+   reading, and the list is too narrow for the whole line on one row. */
+/* What the compute had to settle for - a break with no restaurant, home far
+   from any road - said where the result is, not only in the summary text. */
+.route-notes { margin: 0 0 10px; color: var(--warn); }
+.route-notes:empty { display: none; }
+.legend-dead {
+  display: block; font-size: 11px; line-height: 1.35; color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
 .legend-stop {
   display: block; font-size: 11px; color: var(--warn);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -922,7 +932,7 @@ html, body {
   z-index: 500;
   top: 14px;
   right: 14px;
-  width: 200px;
+  width: 216px;
   max-height: calc(100% - 28px);
   padding: 4px;
   overflow-y: auto;

@@ -1005,8 +1005,10 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
 /* Named places of one kind in a box, for stops between sessions: nodes, and
    buildings or areas by their centre. `filter` is an Overpass tag filter, such
    as ["amenity"="restaurant"]. Cached like the road download; an empty answer
-   is an answer. Fewer tries than the roads: a compute without stops is still a
-   compute, so the caller carries on when this fails. */
+   is an answer. As many tries as the roads get, with the same growing pause:
+   the caller carries on without stops when this fails, but the whole compute
+   is already waiting on it, and the public server fails more often than not
+   for a second or two. */
 const PLACES_CACHE_VERSION = 1;
 
 export async function fetchPlaces(box, filter, { cache = null, progress = null } = {}) {
@@ -1016,7 +1018,7 @@ export async function fetchPlaces(box, filter, { cache = null, progress = null }
   const hit = cache ? await cache.get('overpass', key) : null;
   if (hit) return hit;
   let last = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < config.OVERPASS_RETRIES; attempt++) {
     const endpoint = config.OVERPASS_ENDPOINTS[attempt % config.OVERPASS_ENDPOINTS.length];
     try {
       const json = await postQuery(endpoint, query);
@@ -1035,9 +1037,10 @@ export async function fetchPlaces(box, filter, { cache = null, progress = null }
       return places;
     } catch (err) {
       last = err;
-      if (attempt === 0) {
+      console.warn(`places fetch failed (attempt ${attempt + 1}/${config.OVERPASS_RETRIES}):`, err.message);
+      if (attempt + 1 < config.OVERPASS_RETRIES) {
         if (progress) progress('sessions', 'OpenStreetMap is busy - retrying');
-        await sleep(config.OVERPASS_RETRY_DELAY_MS);
+        await sleep(config.OVERPASS_RETRY_DELAY_MS * (attempt + 1));
       }
     }
   }

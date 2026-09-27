@@ -96,6 +96,7 @@ export function sessionsFromGroups(groups, wps) {
       // Half-open range of tour arcs this session covers.
       arc_span: [wps[group[0].i].arcIndex, end.arcIndex],
       ...(end.stop !== undefined ? { stop: end.stop } : {}),
+      ...(end.home ? { home: true } : {}),
     };
   });
 }
