@@ -22,9 +22,15 @@ import { circuitNodes } from './euler.js';
 
 /* Waypoints that pin `circuit` down, starting and ending at its origin. One
    Dijkstra per *emitted* waypoint, not per candidate: prefix sums make testing
-   a candidate O(1), so a leg costs one search however far it extends. */
+   a candidate O(1), so a leg costs one search however far it extends.
+
+   `stops` are tour positions a waypoint must land on exactly - where one
+   session ends and the next begins - each { position, name, stop }: `stop`
+   is the index of the place stopped at, or undefined for a plain cut. No leg
+   runs past one, and the waypoint sits on the node itself rather than along
+   the arc before it, since that node is the destination. */
 export function reduceTour(g, circuit, { maxLegMetres, maxLegArcs, cutoffSeconds, margin, scale,
-                                         turnaroundFraction = 0.9, progress = null }) {
+                                         turnaroundFraction = 0.9, progress = null, stops = [] }) {
   if (!circuit.length) return [];
   const say = progress || (() => {});
   const nodes = circuitNodes(g, circuit);
@@ -74,13 +80,19 @@ export function reduceTour(g, circuit, { maxLegMetres, maxLegArcs, cutoffSeconds
     arcIndex: 0, cumSeconds: 0, cumMetres: 0, street: 'start',
   }];
 
+  const breaks = [...stops].sort((a, b) => a.position - b.position);
+  let nextBreak = 0;
+
   let i = 0;
   while (i < m) {
     dij.search({ sources: [nodes[i]], cutoff });
+    while (nextBreak < breaks.length && breaks[nextBreak].position <= i) nextBreak++;
+    const stopAt = nextBreak < breaks.length ? breaks[nextBreak].position : Infinity;
 
     let j = i + 1;
     while (j < m) {
       const nxt = j + 1;
+      if (nxt > stopAt) break;
       if (nxt - i > maxLegArcs) break;
       if (preLen[nxt] - preLen[i] > maxLegMetres) break;
       if (!admissible(i, nxt)) break;
@@ -100,7 +112,15 @@ export function reduceTour(g, circuit, { maxLegMetres, maxLegArcs, cutoffSeconds
     const arc = circuit[j - 1];
     const previous = waypoints[waypoints.length - 1];
     let lon, lat, street;
-    if (j === m) {
+    let mark = null;
+    if (j === stopAt) {
+      // A break: on the node itself, named for the place if it is a stop and
+      // for the street if it is a plain cut between sessions.
+      const b = breaks[nextBreak];
+      mark = b.stop !== undefined ? { stop: b.stop } : { cut: true };
+      lon = g.x[nodes[j]]; lat = g.y[nodes[j]];
+      street = b.name || g.streetName(arc);
+    } else if (j === m) {
       // Finish at the tour's end node. A mid-arc point plus a separate closing
       // waypoint would put two waypoints on one arc index, giving a final leg
       // that spans no arcs at all - 0 km and an empty GPX segment.
@@ -124,6 +144,7 @@ export function reduceTour(g, circuit, { maxLegMetres, maxLegArcs, cutoffSeconds
     waypoints.push({
       lon, lat, node: nodes[j], arc, arcIndex: j,
       cumSeconds: preSecs[j], cumMetres: preLen[j], street,
+      ...(mark || {}),
     });
     i = j;
     if (waypoints.length % 250 === 0) {

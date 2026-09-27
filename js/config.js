@@ -7,7 +7,7 @@
 export const VERSION = '1.0.0';
 
 // Bump on ANY algorithm change, or the result cache serves stale routes.
-export const ALGO_VERSION = '17';
+export const ALGO_VERSION = '18';
 
 // -------------------------------------------------------------------- basemap
 // Throw away key for this project - an actual human comment
@@ -217,6 +217,28 @@ export const CHUNK_MAX_SECONDS = 25 * 60;
 
 export const SESSION_SECONDS_DEFAULT = 2 * 3600;
 export const MAX_SESSION_MINUTES = 24 * 60;
+
+/* Break at a restaurant: consecutive sessions joined by a stop. See stops.js.
+   Not calibrated - first guesses, to be tuned against real drives. */
+// How far either side of the even split a stop may move, as a share of one
+// session's length. Under a half, so neighbouring windows never overlap.
+export const STOP_WINDOW_FRACTION = 0.25;
+// The longest detour worth making, there and back together.
+export const STOP_MAX_DETOUR_S = 20 * 60;
+// A restaurant further than this from any drivable road is not one to drive to.
+export const STOP_SNAP_M = 250;
+// Restaurants tried per stop, nearest the window first. Each costs two searches.
+export const STOP_CANDIDATES = 30;
+// Charged for turning straight back where the detour leaves or rejoins the
+// tour, so a stop reached by a U-turn loses to one a few seconds further on.
+export const STOP_UTURN_PENALTY_S = 90;
+// Per second the stop sits away from the even split: a small nudge, so of two
+// equal detours the better-timed one wins.
+export const STOP_OFF_TARGET_WEIGHT = 0.05;
+// Sessions a day, joined by breaks: two is a morning and an afternoon with
+// lunch between. Between days the drive simply ends.
+export const SESSIONS_PER_DAY_DEFAULT = 2;
+export const SESSIONS_PER_DAY_MAX = 6;
 export const PASSES_DEFAULT = 1;
 // A typo guard, not a capability limit: each pass multiplies the whole drive.
 export const PASSES_MAX = 50;

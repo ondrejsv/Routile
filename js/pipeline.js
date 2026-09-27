@@ -13,7 +13,10 @@ import * as oneway from './oneway.js';
 import * as turns from './turns.js';
 import { eulerianCircuit, verifyCircuit } from './euler.js';
 import { reduceTour } from './waypoints.js';
-import { chunkWaypoints, groupSessions, verifyChunks } from './sessions.js';
+import {
+  chunkAtStops, chunkWaypoints, groupSessions, sessionsFromGroups, verifyChunks,
+} from './sessions.js';
+import { planStops } from './stops.js';
 import { summarise } from './stats.js';
 import { SelectionError, parseRules, rulesKey, rulesToJSON } from './selection.js';
 
@@ -31,6 +34,12 @@ export const PHASES = [
 ];
 
 export class RequestError extends Error {}
+
+/* What joins one session to the next: nothing - a session simply ends where
+   the length runs out - or a stop at a place of this kind. Each maps to the
+   Overpass tag filter its places are fetched by. */
+const BREAK_PLACES = { restaurant: '["amenity"="restaurant"]' };
+export const SESSION_BREAKS = Object.keys(BREAK_PLACES);
 
 function positiveInt(raw, what) {
   if (typeof raw === 'boolean' || !/^\s*\d+\s*$/.test(String(raw))) throw new RequestError(`${what} must be a whole number`);
@@ -93,6 +102,14 @@ export function parseRequest(payload) {
     if (err instanceof SelectionError) throw new RequestError(err.message);
     throw err;
   }
+  const sessionBreak = payload.session_break ?? null;
+  if (sessionBreak !== null && !SESSION_BREAKS.includes(sessionBreak)) {
+    throw new RequestError(`'${sessionBreak}' is not a kind of break between sessions`);
+  }
+  const sessionsPerDay = positiveInt(payload.sessions_per_day ?? config.SESSIONS_PER_DAY_DEFAULT, 'sessions per day');
+  if (sessionsPerDay < 2 || sessionsPerDay > config.SESSIONS_PER_DAY_MAX) {
+    throw new RequestError(`sessions per day must be between 2 and ${config.SESSIONS_PER_DAY_MAX}`);
+  }
   const start = payload.start || null;
   return {
     area,
@@ -105,6 +122,9 @@ export function parseRequest(payload) {
     bothDirections: Boolean(payload.both_directions ?? config.BOTH_DIRECTIONS_DEFAULT),
     passes,
     sessionSeconds: sessionMinutes * 60,
+    sessionBreak,
+    // Only means anything with a break to put between them.
+    sessionsPerDay: sessionBreak ? sessionsPerDay : null,
     margin: config.WAYPOINT_MARGIN,
     maxLegMetres: config.WAYPOINT_MAX_LEG_M,
     maxLegArcs: config.WAYPOINT_MAX_LEG_ARCS,
@@ -125,7 +145,7 @@ export function requestKey(req) {
     req.includePrivate, req.deadEndM,
     [...req.overrides].map(([w, f]) => `${w}:${f.drive}`).sort(),
     rulesKey(req.selection),
-    req.bothDirections, req.passes, req.sessionSeconds,
+    req.bothDirections, req.passes, req.sessionSeconds, req.sessionBreak, req.sessionsPerDay,
     req.margin, req.maxLegMetres, req.maxLegArcs,
   ]);
 }
@@ -202,8 +222,19 @@ export async function compute(req, { progress = null, cache = null } = {}) {
     + `${audit.turnarounds} turnarounds at a dead end`);
   verifyCircuit(g, circuit, roadMult, start);
 
+  // Breaks between sessions, spliced into the tour as detours before anything
+  // is cut from it. Everything below reads `drive`, the tour as driven.
+  const breaks = await planBreaks(req, g, circuit, { cache, say });
+  const drive = breaks.circuit;
+  const stops = breaks.cuts.filter((b) => b.place);
+  addDetours(tour, stops);
+
   say('waypoints', 'working out the navigation points');
-  const wps = reduceTour(g, circuit, {
+  let stopIndex = 0;
+  const wps = reduceTour(g, drive, {
+    stops: breaks.cuts.map((b) => (b.place
+      ? { position: b.position, name: b.place.name, stop: stopIndex++ }
+      : { position: b.position })),
     maxLegMetres: req.maxLegMetres, maxLegArcs: req.maxLegArcs,
     cutoffSeconds: config.WAYPOINT_DIJKSTRA_CUTOFF_S, margin: req.margin,
     scale: config.MCF_TIME_SCALE, turnaroundFraction: config.WAYPOINT_TURNAROUND_FRACTION,
@@ -211,12 +242,24 @@ export async function compute(req, { progress = null, cache = null } = {}) {
   });
 
   say('sessions', 'splitting into sessions');
-  const chunks = chunkWaypoints(wps, config.CHUNK_WAYPOINTS, config.CHUNK_MAX_SECONDS);
-  verifyChunks(chunks, wps);
-  const sessions = groupSessions(chunks, wps, req.sessionSeconds);
+  let sessions;
+  if (breaks.cuts.length) {
+    // One session per stretch between cuts: planStops() placed every one of
+    // them, stop or plain, so the count is the one the length asked for.
+    const cutWaypoints = wps.map((w, n) => (w.stop !== undefined || w.cut ? n : -1)).filter((n) => n >= 0);
+    const { chunks, groups } = chunkAtStops(wps, cutWaypoints, config.CHUNK_WAYPOINTS, config.CHUNK_MAX_SECONDS);
+    verifyChunks(chunks, wps);
+    sessions = sessionsFromGroups(groups, wps);
+    sessions.forEach((s) => { s.day = Math.floor(s.index / req.sessionsPerDay); });
+  } else {
+    const chunks = chunkWaypoints(wps, config.CHUNK_WAYPOINTS, config.CHUNK_MAX_SECONDS);
+    verifyChunks(chunks, wps);
+    sessions = groupSessions(chunks, wps, req.sessionSeconds);
+  }
 
-  const { track, arcStart, trackWay } = buildTrack(g, circuit);
+  const { track, arcStart, trackWay } = buildTrack(g, drive);
   const coverage = osm.coverageToDict(net.report);
+  if (breaks.note) coverage.summary += ` - ${breaks.note}`;
   const result = {
     request: {
       area: req.area.toJSON(),
@@ -226,6 +269,8 @@ export async function compute(req, { progress = null, cache = null } = {}) {
       both_directions: req.bothDirections,
       passes: req.passes,
       session_minutes: Math.round(req.sessionSeconds / 60),
+      session_break: req.sessionBreak,
+      sessions_per_day: req.sessionsPerDay,
     },
     coverage,
     stats: summarise(tour, wps.length, sessions.length),
@@ -234,13 +279,72 @@ export async function compute(req, { progress = null, cache = null } = {}) {
       lat: round6(w.lat), lon: round6(w.lon), street: w.street,
       km: Math.round(w.cumMetres) / 1000, arc_index: w.arcIndex,
     })),
-    roads: roadList(g, circuit, track, trackWay),
+    stops: stops.map((s, k) => ({
+      name: s.place.name, lat: round6(s.place.lat), lon: round6(s.place.lon),
+      osm_type: s.place.osm_type, osm_id: s.place.osm_id,
+      cuisine: s.place.cuisine, opening_hours: s.place.opening_hours, website: s.place.website,
+      detour_km: Math.round(s.detour_m / 10) / 100, detour_min: Math.round(s.detour_s / 6) / 10,
+      snap_m: s.snap_m,
+      after_session: sessions.findIndex((x) => x.stop === k),
+    })),
+    roads: roadList(g, drive, track, trackWay),
     track,
     arc_start: arcStart,
     start: { lat: g.y[start], lon: g.x[start] },
   };
   say('done', coverage.summary);
   return result;
+}
+
+/* The cuts between sessions, if the request asks for breaks: the places are
+   fetched for the fetch box, and planStops() puts a stop at a restaurant
+   between the sessions of a day and a plain cut between days, splicing the
+   detours in. A compute never fails for want of a restaurant - no download,
+   or none in reach, and that cut is a plain one, with a note saying so. */
+async function planBreaks(req, g, circuit, { cache, say }) {
+  const none = { circuit, cuts: [], note: null };
+  if (!req.sessionBreak) return none;
+  say('sessions', 'finding restaurants for the breaks');
+  let places;
+  try {
+    const { fetchBox } = osm.roadBoxes(req.area, fetchBufferM(req));
+    places = await osm.fetchPlaces(fetchBox, BREAK_PLACES[req.sessionBreak], { cache, progress: say });
+  } catch (err) {
+    console.warn('no places for the breaks:', err.message);
+    return { ...none, note: 'restaurants could not be downloaded, so sessions are cut by length' };
+  }
+  const plan = planStops(g, circuit, places, {
+    sessionSeconds: req.sessionSeconds,
+    perDay: req.sessionsPerDay,
+    windowFraction: config.STOP_WINDOW_FRACTION,
+    maxDetourS: config.STOP_MAX_DETOUR_S,
+    snapM: config.STOP_SNAP_M,
+    candidates: config.STOP_CANDIDATES,
+    uturnPenaltyS: config.STOP_UTURN_PENALTY_S,
+    offTargetWeight: config.STOP_OFF_TARGET_WEIGHT,
+    scale: config.MCF_TIME_SCALE,
+  });
+  const placed = plan.breaks.filter((b) => b.place).length;
+  const missed = plan.breaks.filter((b) => b.missed).length;
+  console.info(`breaks: ${placed} of ${placed + missed} placed from ${places.length} restaurants, `
+    + `${plan.breaks.length - placed - missed} day ends`);
+  const note = missed
+    ? `${missed} of ${placed + missed} breaks found no restaurant within reach and are plain cuts`
+    : null;
+  return { circuit: plan.circuit, cuts: plan.breaks, note };
+}
+
+// The detours count towards the drive: as deadheading, since they cover nothing.
+function addDetours(tour, stops) {
+  if (!stops.length) return;
+  const m = stops.reduce((s, x) => s + x.detour_m, 0);
+  const secs = stops.reduce((s, x) => s + x.detour_s, 0);
+  const round2 = (v) => Math.round(v * 100) / 100;
+  tour.total_km = round2(tour.total_km + m / 1000);
+  tour.deadhead_km = round2(tour.deadhead_km + m / 1000);
+  tour.total_seconds += secs;
+  tour.deadhead_pct = tour.total_km ? Math.round(1000 * tour.deadhead_km / tour.total_km) / 10 : 0;
+  tour.stops_km = round2(m / 1000);
 }
 
 /* The roads the drive actually touches, for the map's street editor: one entry

@@ -382,6 +382,8 @@ mapEl.addEventListener('pointerdown', (ev) => {
   // A second finger mid-drag is a pinch, not a second zone.
   if (drag) return;
   if (ev.target.closest('.leaflet-control')) return;
+  // A break's marker is clicked for its card, whatever tool is armed.
+  if (ev.target.closest('.stop-marker, .leaflet-popup')) return;
   const tool = activeTool(ev);
   if (!tool) return;
 
@@ -951,6 +953,8 @@ $('search-input').addEventListener('input', () => {
 $('repo-version').textContent = config.VERSION;
 
 $('passes').max = String(config.PASSES_MAX);
+$('sessions-per-day').max = String(config.SESSIONS_PER_DAY_MAX);
+$('sessions-per-day').value = String(config.SESSIONS_PER_DAY_DEFAULT);
 $('private-roads').checked = config.INCLUDE_PRIVATE_DEFAULT;
 $(config.BOTH_DIRECTIONS_DEFAULT ? 'dir-both' : 'dir-oneway').checked = true;
 $('session').value = String(Math.round((config.SESSION_SECONDS_DEFAULT / 3600) * 100) / 100);
@@ -963,6 +967,21 @@ function sessionEnabled() { return $('session-enabled').checked; }
 
 function syncSessionField() {
   $('session-field').classList.toggle('hidden', !sessionEnabled());
+  $('session-break-field').classList.toggle('hidden', !sessionEnabled());
+  $('session-day-field').classList.toggle('hidden', !sessionBreak());
+}
+
+// Whole number from 2 to the cap, or null.
+function sessionsPerDay() {
+  const raw = $('sessions-per-day').value.trim();
+  if (!/^\d+$/.test(raw)) return null;
+  const n = parseInt(raw, 10);
+  return n >= 2 && n <= config.SESSIONS_PER_DAY_MAX ? n : null;
+}
+
+// A break needs two sessions to sit between, so it rides on the split.
+function sessionBreak() {
+  return sessionEnabled() && $('session-restaurant').checked ? 'restaurant' : null;
 }
 syncSessionField();
 
@@ -994,9 +1013,14 @@ function validate() {
   const hours = sessionHours();
   markValid($('passes'), passes !== null);
   markValid($('session'), !sessionEnabled() || hours !== null);
+  const perDay = sessionsPerDay();
+  markValid($('sessions-per-day'), !sessionBreak() || perDay !== null);
   const rules = validateRules();
   if (passes === null) return 'Passes must be a whole number of 1 or more.';
   if (hours === null) return 'Session length must be a number of hours between 0.1 and 24.';
+  if (sessionBreak() && perDay === null) {
+    return `Sessions per day must be a whole number from 2 to ${config.SESSIONS_PER_DAY_MAX}.`;
+  }
   return rules;
 }
 
@@ -1329,6 +1353,8 @@ function payload() {
     both_directions: bothDirections(),
     passes: passesValue() || 1,
     session_minutes: (sessionHours() || NO_SPLIT_HOURS) * 60,
+    session_break: sessionBreak(),
+    sessions_per_day: sessionsPerDay() || config.SESSIONS_PER_DAY_DEFAULT,
   };
   if (state.startLatLng) {
     body.start = { lat: state.startLatLng.lat, lon: state.startLatLng.lng };
@@ -1360,9 +1386,9 @@ function runCheck() {
 }
 
 ['passes', 'session', 'dir-oneway', 'dir-both', 'session-enabled',
- 'private-roads'].forEach((id) => {
+ 'private-roads', 'session-restaurant', 'sessions-per-day'].forEach((id) => {
   $(id).addEventListener('change', () => {
-    if (id === 'session-enabled') syncSessionField();
+    if (id === 'session-enabled' || id === 'session-restaurant') syncSessionField();
     // Service roads in or out is a different download to match against.
     if (id === 'private-roads') dropAllPreviews();
     // A different question gives a different set of streets, so what the editor
@@ -1505,6 +1531,8 @@ function formState() {
     selection: state.rules,
     passes: passesValue() || 1,
     splitSessions: sessionEnabled(),
+    breakAtRestaurant: $('session-restaurant').checked,
+    sessionsPerDay: sessionsPerDay() || config.SESSIONS_PER_DAY_DEFAULT,
     sessionHours: sessionHours() || NO_SPLIT_HOURS,
   };
 }
@@ -1596,6 +1624,9 @@ function restoreRoute(meta, { fit = true } = {}) {
   // put it in. The loaded route still drew with whatever it was computed at;
   // a recompute from here uses today's value.
   $('session-enabled').checked = !!form.splitSessions;
+  $('session-restaurant').checked = !!form.breakAtRestaurant;
+  $('sessions-per-day').value = String(Math.min(Math.max(Math.round(form.sessionsPerDay) || config.SESSIONS_PER_DAY_DEFAULT, 2),
+    config.SESSIONS_PER_DAY_MAX));
   const hours = Number(form.sessionHours);
   if (Number.isFinite(hours) && hours >= 0.1 && hours <= NO_SPLIT_HOURS) {
     $('session').value = String(hours);
@@ -3017,7 +3048,8 @@ function drawSessions(res, track, { fit = true } = {}) {
     dots: res.waypoints || [],
   });
 
-  buildLegend(sessions);
+  buildLegend(sessions, res.stops || []);
+  drawStops(res);
 
   const drawn = state.routeLayers.filter(Boolean);
   if (fit && drawn.length) {
@@ -3049,7 +3081,7 @@ function sessionOf(item) {
   return item.dataset.session === 'all' ? null : Number(item.dataset.session);
 }
 
-function legendRow(key, color, name, km, minutes) {
+function legendRow(key, color, name, km, minutes, then = '') {
   // The stripe is on every row, colourless on All sessions, so each label in
   // the list starts at the same place.
   return `<button type="button" class="legend-item${color ? '' : ' legend-all'}"`
@@ -3058,13 +3090,24 @@ function legendRow(key, color, name, km, minutes) {
     + '<span class="legend-text">'
     + `<span class="legend-name">${name}</span>`
     + `<span class="legend-meta">${Number(km).toFixed(1)} km · ${humanMinutes(minutes)}</span>`
+    + (then ? `<span class="legend-stop">${escapeHtml(then)}</span>` : '')
     + '</span></button>';
 }
 
-function buildLegend(sessions) {
+// What comes after a session, under its figures: the restaurant its break is
+// at, or the end of the day, when sessions are joined into days.
+function sessionThen(sessions, stops, i) {
+  const s = sessions[i];
+  if (s.stop !== undefined && stops[s.stop]) return `then ${stops[s.stop].name}`;
+  if (s.day === undefined) return '';
+  const next = sessions[i + 1];
+  return !next || next.day !== s.day ? `end of day ${s.day + 1}` : '';
+}
+
+function buildLegend(sessions, stops = []) {
   const box = $('legend');
-  const rows = sessions.map((session, i) =>
-    legendRow(i, sessionColor(i), `Session ${i + 1}`, session.km, session.minutes));
+  const rows = sessions.map((session, i) => legendRow(i, sessionColor(i), `Session ${i + 1}`,
+    session.km, session.minutes, sessionThen(sessions, stops, i)));
   // Totalled from the rows it sits above, so the sums agree with the list. One
   // session is already its own whole route, so the row would only repeat it.
   if (sessions.length > 1) {
@@ -3208,7 +3251,42 @@ function humanMinutes(minutes) {
   return `${Math.floor(total / 60)} h ${total % 60} min`;
 }
 
+/* The breaks between sessions, one marker each: a knife and fork on the
+   restaurant itself - not on the node the drive stops at, which may be across
+   the road - named on hover, with the details on a click. */
+const STOP_ICON = L.divIcon({
+  className: 'stop-marker',
+  html: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v7.5a2 2 0 0 0 4 0V3M9 3v18M16.5 21V3c-1.9 1-3 3.6-3 6.5 0 2.2.9 3.5 3 3.5"/></svg>',
+  iconSize: [28, 28], iconAnchor: [14, 14], popupAnchor: [0, -14],
+});
+
+function drawStops(res) {
+  if (state.stopLayer) { map.removeLayer(state.stopLayer); state.stopLayer = null; }
+  const stops = res.stops || [];
+  if (!stops.length) return;
+  state.stopLayer = L.layerGroup(stops.map((st, k) => {
+    const after = st.after_session >= 0 ? st.after_session + 1 : null;
+    const facts = [
+      st.cuisine ? st.cuisine.replace(/;/g, ', ') : null,
+      st.detour_km > 0 ? `${st.detour_km} km off the route, ${humanMinutes(st.detour_min)} there and back` : 'right on the route',
+    ].filter(Boolean);
+    const link = `https://www.openstreetmap.org/${st.osm_type}/${st.osm_id}`;
+    const html = '<div class="road-card stop-card">'
+      + `<div class="road-card-name">${escapeHtml(st.name)}</div>`
+      + `<div class="road-card-meta">${after ? `Break after session ${after}` : `Break ${k + 1}`}</div>`
+      + facts.map((f) => `<div class="stop-fact">${escapeHtml(f)}</div>`).join('')
+      + (st.opening_hours ? `<div class="stop-fact">Open: ${escapeHtml(st.opening_hours)}</div>` : '')
+      + (/^https?:\/\//i.test(st.website || '') ? `<a class="road-card-link" target="_blank" rel="noopener noreferrer" href="${escapeHtml(st.website)}">Website</a> · ` : '')
+      + `<a class="road-card-link" target="_blank" rel="noopener noreferrer" href="${link}">OpenStreetMap</a>`
+      + '</div>';
+    return L.marker([st.lat, st.lon], { icon: STOP_ICON, keyboard: true, title: st.name })
+      .bindTooltip(escapeHtml(st.name), { direction: 'top', offset: [0, -14] })
+      .bindPopup(html, { className: 'road-popup', maxWidth: 280 });
+  })).addTo(map);
+}
+
 function clearRouteLayers() {
+  if (state.stopLayer) { map.removeLayer(state.stopLayer); state.stopLayer = null; }
   for (const line of state.routeLayers) {
     if (line) map.removeLayer(line);
   }

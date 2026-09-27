@@ -709,6 +709,25 @@ html, body {
 }
 .road-popup .road-card-link:hover { color: var(--accent); text-decoration: underline; }
 
+/* A break between sessions: a knife and fork on the restaurant, in a disc of
+   the map's own ground so it reads over the route lines. */
+.stop-marker {
+  display: grid; place-items: center;
+  color: var(--map-ink); background: var(--map-bg);
+  border: 2px solid var(--warn); border-radius: 50%;
+  box-shadow: var(--shadow);
+}
+.stop-marker svg {
+  width: 16px; height: 16px;
+  fill: none; stroke: currentColor; stroke-width: 1.9;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.stop-card .stop-fact { margin-top: 3px; font-size: 12px; color: var(--ink-2); }
+.legend-stop {
+  display: block; font-size: 11px; color: var(--warn);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 /* The Identify card: the same shell, holding a road's tags. One row per tag,
    key and value in the monospace a filter is written in, the box ticking it
    into the filter shown below. Scrolls rather than growing: a well-mapped

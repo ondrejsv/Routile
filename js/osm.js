@@ -1002,6 +1002,48 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
   return { graph: H, required, restricted: turnRestrictions(H, elements), report };
 }
 
+/* Named places of one kind in a box, for stops between sessions: nodes, and
+   buildings or areas by their centre. `filter` is an Overpass tag filter, such
+   as ["amenity"="restaurant"]. Cached like the road download; an empty answer
+   is an answer. Fewer tries than the roads: a compute without stops is still a
+   compute, so the caller carries on when this fails. */
+const PLACES_CACHE_VERSION = 1;
+
+export async function fetchPlaces(box, filter, { cache = null, progress = null } = {}) {
+  const bbox = `${box.bottom},${box.left},${box.top},${box.right}`;
+  const query = `[out:json][timeout:60];nwr${filter}["name"](${bbox});out center tags;`;
+  const key = `places/v${PLACES_CACHE_VERSION}|${query}`;
+  const hit = cache ? await cache.get('overpass', key) : null;
+  if (hit) return hit;
+  let last = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const endpoint = config.OVERPASS_ENDPOINTS[attempt % config.OVERPASS_ENDPOINTS.length];
+    try {
+      const json = await postQuery(endpoint, query);
+      if (json.remark && /error/i.test(json.remark)) throw new Error(json.remark);
+      const places = (json.elements || []).map((el) => {
+        const at = el.type === 'node' ? el : el.center;
+        if (!at) return null;
+        const t = el.tags || {};
+        return {
+          osm_type: el.type, osm_id: el.id, lat: at.lat, lon: at.lon, name: t.name,
+          cuisine: t.cuisine || null, opening_hours: t.opening_hours || null,
+          website: t.website || t['contact:website'] || null,
+        };
+      }).filter(Boolean);
+      if (cache) await cache.put('overpass', key, places);
+      return places;
+    } catch (err) {
+      last = err;
+      if (attempt === 0) {
+        if (progress) progress('sessions', 'OpenStreetMap is busy - retrying');
+        await sleep(config.OVERPASS_RETRY_DELAY_MS);
+      }
+    }
+  }
+  throw new FetchError(`could not download restaurants (${last ? last.message : 'no response'})`);
+}
+
 /* The two boxes a compute works in: the fetch box the graph is trimmed to, and
    the download box around it. Shared with the rule preview, so what it shows
    is drawn from the very download a compute of the same zones would use - the

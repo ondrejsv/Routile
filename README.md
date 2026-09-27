@@ -15,7 +15,7 @@ Draw an area, get a driving route that covers every street in it. A static web p
 1. **Find your spot.** Search for a place, or pan and zoom the map.
 2. **Draw the area.** Rectangle, Circle or Freehand. Zones merge where they overlap; **Subtract** crops one back out. Hold the middle or right mouse button to pan mid-shape.
 3. **Drop a start pin** — optional. Without one the drive starts from the centre of your area.
-4. **Choose how to drive it.** One way covers every street once; Both ways drives each one in both directions. Passes repeats the whole route. Split into sessions cuts the drive into outings of a given length.
+4. **Choose how to drive it.** One way covers every street once; Both ways drives each one in both directions. Passes repeats the whole route. Split into sessions cuts the drive into outings of a given length. With **Break at a restaurant** on as well, each session ends at a named restaurant from OpenStreetMap and the next one starts there. The break goes near the even split, where the detour off the route is shortest, and the restaurant is marked on the map and named in the session list. There are no ratings yet; any named restaurant counts. **Sessions per day** (2 by default) sets how many sessions the breaks join into one day, such as a morning and an afternoon with lunch between. Between days the drive simply ends.
 5. **Compute route**, then **Download**.
 
 The page remembers where you left it. A reload brings back the zones, the settings and the route; **Clear** is what forgets them.

@@ -39,17 +39,14 @@ export function verifyChunks(chunks, wps) {
   }
 }
 
-// Batch chunks into sessions of roughly `sessionSeconds`. A chunk longer than
-// the budget gets its own session: it is already as small as waypoints allow.
-export function groupSessions(chunks, wps, sessionSeconds) {
-  if (sessionSeconds <= 0) throw new Error('session length must be positive');
+// Batch chunks into groups of roughly `budget` seconds. A chunk longer than
+// the budget gets its own group: it is already as small as waypoints allow.
+export function batchChunks(chunks, wps, budget) {
   const seconds = (c) => Math.max(wps[c.j].cumSeconds - wps[c.i].cumSeconds, 0);
-  const metres = (c) => Math.max(wps[c.j].cumMetres - wps[c.i].cumMetres, 0);
-
   const groups = [];
   let current = [], running = 0;
   for (const c of chunks) {
-    if (current.length && running + seconds(c) > sessionSeconds) {
+    if (current.length && running + seconds(c) > budget) {
       groups.push(current);
       current = []; running = 0;
     }
@@ -57,13 +54,48 @@ export function groupSessions(chunks, wps, sessionSeconds) {
     running += seconds(c);
   }
   if (current.length) groups.push(current);
+  return groups;
+}
 
-  return groups.map((group, index) => ({
-    index,
-    km: Math.round(group.reduce((s, c) => s + metres(c), 0) / 10) / 100,
-    minutes: Math.round(group.reduce((s, c) => s + seconds(c), 0) / 6) / 10,
-    chunks: group.length,
-    // Half-open range of tour arcs this session covers.
-    arc_span: [wps[group[0].i].arcIndex, wps[group[group.length - 1].j].arcIndex],
-  }));
+// Batch chunks into sessions of roughly `sessionSeconds`.
+export function groupSessions(chunks, wps, sessionSeconds) {
+  if (sessionSeconds <= 0) throw new Error('session length must be positive');
+  return sessionsFromGroups(batchChunks(chunks, wps, sessionSeconds), wps);
+}
+
+/* Sessions cut at breaks instead of by length: one session per stretch between
+   consecutive stop waypoints, each chunked as usual. `stopWaypoints` are the
+   indices of those waypoints, in tour order. The same session records as
+   groupSessions(), and the same chunk list for verifyChunks(). */
+export function chunkAtStops(wps, stopWaypoints, perChunk, maxSeconds) {
+  const cuts = [0, ...stopWaypoints.filter((w) => w > 0 && w < wps.length - 1), wps.length - 1];
+  const chunks = [], groups = [];
+  for (let k = 1; k < cuts.length; k++) {
+    const lo = cuts[k - 1], hi = cuts[k];
+    if (hi <= lo) continue;
+    const part = chunkWaypoints(wps.slice(lo, hi + 1), perChunk, maxSeconds)
+      .map((c) => ({ i: c.i + lo, j: c.j + lo }));
+    chunks.push(...part);
+    groups.push(part);
+  }
+  return { chunks, groups };
+}
+
+// Session records from groups of chunks. A session that ends on a stop
+// waypoint says which stop, so the page and the GPX can name the break.
+export function sessionsFromGroups(groups, wps) {
+  const seconds = (c) => Math.max(wps[c.j].cumSeconds - wps[c.i].cumSeconds, 0);
+  const metres = (c) => Math.max(wps[c.j].cumMetres - wps[c.i].cumMetres, 0);
+  return groups.map((group, index) => {
+    const end = wps[group[group.length - 1].j];
+    return {
+      index,
+      km: Math.round(group.reduce((s, c) => s + metres(c), 0) / 10) / 100,
+      minutes: Math.round(group.reduce((s, c) => s + seconds(c), 0) / 6) / 10,
+      chunks: group.length,
+      // Half-open range of tour arcs this session covers.
+      arc_span: [wps[group[0].i].arcIndex, end.arcIndex],
+      ...(end.stop !== undefined ? { stop: end.stop } : {}),
+    };
+  });
 }
