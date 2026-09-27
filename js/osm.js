@@ -1009,7 +1009,7 @@ export async function prepare(area, { bufferM, snapDeg, minInsideM,
    the caller carries on without stops when this fails, but the whole compute
    is already waiting on it, and the public server fails more often than not
    for a second or two. */
-const PLACES_CACHE_VERSION = 1;
+const PLACES_CACHE_VERSION = 2;
 
 export async function fetchPlaces(box, filter, { cache = null, progress = null } = {}) {
   const bbox = `${box.bottom},${box.left},${box.top},${box.right}`;
@@ -1027,11 +1027,8 @@ export async function fetchPlaces(box, filter, { cache = null, progress = null }
         const at = el.type === 'node' ? el : el.center;
         if (!at) return null;
         const t = el.tags || {};
-        return {
-          osm_type: el.type, osm_id: el.id, lat: at.lat, lon: at.lon, name: t.name,
-          cuisine: t.cuisine || null, opening_hours: t.opening_hours || null,
-          website: t.website || t['contact:website'] || null,
-        };
+        // Every tag, for the stop's card: hours, phone, address, what it serves.
+        return { osm_type: el.type, osm_id: el.id, lat: at.lat, lon: at.lon, name: t.name, tags: t };
       }).filter(Boolean);
       if (cache) await cache.put('overpass', key, places);
       return places;

@@ -44,6 +44,8 @@ const state = {
   // [{op, kind, text}]: which roads in the zones must be driven. Empty means
   // all of them. See selection.js.
   rules: [],
+  // [{ref, name}]: restaurants the breaks never stop at. See the banned list.
+  bannedPlaces: [],
   streetLayers: [],    // one line per coverage state, while editing
   focusLayers: [],     // the hovered and selected streets, over those
   routeArrows: null,   // kept so the editor can hand the map back as it found it
@@ -969,6 +971,7 @@ function syncSessionField() {
   $('session-field').classList.toggle('hidden', !sessionEnabled());
   $('session-break-field').classList.toggle('hidden', !sessionEnabled());
   $('session-day-field').classList.toggle('hidden', !sessionBreak());
+  $('banned-field').classList.toggle('hidden', !sessionBreak());
 }
 
 // Whole number from 2 to the cap, or null.
@@ -1339,6 +1342,83 @@ $('add-tag-rule').addEventListener('click', () => addRule('tags'));
 $('add-query-rule').addEventListener('click', () => addRule('overpass'));
 renderRules();
 
+/* ------------------------------------------------------ banned restaurants */
+/* Restaurants the breaks never stop at, as [{ref: 'node/123', name}]. The name
+   is only for the list - an id typed in by hand has none until a route shows
+   the place. Saved with the form, sent as refs. */
+
+// An OSM ref from whatever was pasted: node/123, n123, "way 45", or a link to
+// the object on openstreetmap.org. A bare number is taken as a node, which
+// most restaurants are. null if it is none of those.
+function parseOsmRef(text) {
+  const s = String(text).trim();
+  const kinds = { n: 'node', w: 'way', r: 'relation', node: 'node', way: 'way', relation: 'relation' };
+  let m = /openstreetmap\.org\/(node|way|relation)\/(\d+)/i.exec(s)
+    || /^(node|way|relation)\s*[/ ]\s*(\d+)$/i.exec(s)
+    || /^([nwr])\s*(\d+)$/i.exec(s);
+  if (m) return `${kinds[m[1].toLowerCase()]}/${m[2]}`;
+  m = /^(\d+)$/.exec(s);
+  return m ? `node/${m[1]}` : null;
+}
+
+function renderBanned() {
+  const list = $('banned-list');
+  list.replaceChildren(...state.bannedPlaces.map((b) => {
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.href = `https://www.openstreetmap.org/${b.ref}`;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = b.name || b.ref;
+    a.title = b.ref;
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'rule-del';
+    del.textContent = '×';
+    del.setAttribute('aria-label', `Allow ${b.name || b.ref} again`);
+    del.addEventListener('click', () => {
+      state.bannedPlaces = state.bannedPlaces.filter((x) => x.ref !== b.ref);
+      bannedChanged();
+    });
+    li.append(a, del);
+    return li;
+  }));
+}
+
+// A changed list is a different question. With a route on the map it is
+// answered straight away, as a coverage edit is, on the same piece of map.
+function bannedChanged() {
+  renderBanned();
+  saveSession();
+  if (state.result && sessionBreak()) recompute({ keepView: true });
+}
+
+function banPlace(ref, name = '') {
+  const held = state.bannedPlaces.find((b) => b.ref === ref);
+  if (held) {
+    if (name && !held.name) { held.name = name; renderBanned(); saveSession(); }
+    return;
+  }
+  state.bannedPlaces.push({ ref, name });
+  bannedChanged();
+}
+
+$('banned-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const input = $('banned-input');
+  if (!input.value.trim()) return;
+  const ref = parseOsmRef(input.value);
+  input.classList.toggle('invalid', !ref);
+  $('banned-error').textContent = ref ? '' : 'Not an OSM id - try node/123, n123 or a link to the restaurant on openstreetmap.org.';
+  if (!ref) return;
+  input.value = '';
+  banPlace(ref);
+});
+$('banned-input').addEventListener('input', () => {
+  $('banned-input').classList.remove('invalid');
+  $('banned-error').textContent = '';
+});
+
 /* --------------------------------------------------------------- request */
 function payload() {
   const body = {
@@ -1355,6 +1435,7 @@ function payload() {
     session_minutes: (sessionHours() || NO_SPLIT_HOURS) * 60,
     session_break: sessionBreak(),
     return_home: $('return-home').checked,
+    banned_places: state.bannedPlaces.map((b) => b.ref),
     sessions_per_day: sessionsPerDay() || config.SESSIONS_PER_DAY_DEFAULT,
   };
   if (state.startLatLng) {
@@ -1534,6 +1615,7 @@ function formState() {
     splitSessions: sessionEnabled(),
     breakAtRestaurant: $('session-restaurant').checked,
     returnHome: $('return-home').checked,
+    bannedPlaces: state.bannedPlaces,
     sessionsPerDay: sessionsPerDay() || config.SESSIONS_PER_DAY_DEFAULT,
     sessionHours: sessionHours() || NO_SPLIT_HOURS,
   };
@@ -1628,6 +1710,11 @@ function restoreRoute(meta, { fit = true } = {}) {
   $('session-enabled').checked = !!form.splitSessions;
   $('session-restaurant').checked = !!form.breakAtRestaurant;
   $('return-home').checked = !!form.returnHome;
+  state.bannedPlaces = Array.isArray(form.bannedPlaces)
+    ? form.bannedPlaces.filter((b) => b && parseOsmRef(b.ref) === b.ref)
+      .map((b) => ({ ref: b.ref, name: String(b.name || '') }))
+    : [];
+  renderBanned();
   $('sessions-per-day').value = String(Math.min(Math.max(Math.round(form.sessionsPerDay) || config.SESSIONS_PER_DAY_DEFAULT, 2),
     config.SESSIONS_PER_DAY_MAX));
   const hours = Number(form.sessionHours);
@@ -3280,28 +3367,125 @@ const STOP_ICON = L.divIcon({
   iconSize: [28, 28], iconAnchor: [14, 14], popupAnchor: [0, -14],
 });
 
+/* What the stop's card says about the place, from its OSM tags: the ones a
+   driver deciding on lunch reads, labelled, in this order. The rest are in the
+   card's full tag list. A route saved before stops carried tags falls back to
+   the three fields it did carry. */
+const STOP_FACTS = [
+  ['cuisine', 'Cuisine', (v) => v.replace(/;/g, ', ').replace(/_/g, ' ')],
+  ['opening_hours', 'Open'],
+  ['phone', 'Phone', null, (v) => `tel:${v.split(';')[0].replace(/[^\d+]/g, '')}`],
+  ['contact:phone', 'Phone', null, (v) => `tel:${v.split(';')[0].replace(/[^\d+]/g, '')}`],
+  ['email', 'Email', null, (v) => `mailto:${v.split(';')[0].trim()}`],
+  ['contact:email', 'Email', null, (v) => `mailto:${v.split(';')[0].trim()}`],
+  ['diet:vegetarian', 'Vegetarian'],
+  ['diet:vegan', 'Vegan'],
+  ['diet:gluten_free', 'Gluten free'],
+  ['outdoor_seating', 'Outdoor seating'],
+  ['takeaway', 'Takeaway'],
+  ['reservation', 'Reservation'],
+  ['wheelchair', 'Wheelchair'],
+  ['air_conditioning', 'Air conditioning'],
+  ['smoking', 'Smoking'],
+  ['capacity', 'Seats'],
+  ['description', 'About'],
+];
+
+function stopTags(st) {
+  if (st.tags) return st.tags;
+  const t = { name: st.name };
+  if (st.cuisine) t.cuisine = st.cuisine;
+  if (st.opening_hours) t.opening_hours = st.opening_hours;
+  if (st.website) t.website = st.website;
+  return t;
+}
+
+// "Street 12, 851 01 City" from the addr:* tags, or '' when OSM has none.
+function stopAddress(t) {
+  const street = [t['addr:street'] || t['addr:place'],
+    t['addr:housenumber'] || t['addr:streetnumber'] || t['addr:conscriptionnumber']].filter(Boolean).join(' ');
+  const town = [t['addr:postcode'], t['addr:city'] || t['addr:town'] || t['addr:village']].filter(Boolean).join(' ');
+  return [street, town].filter(Boolean).join(', ');
+}
+
+const httpUrl = (v) => (/^https?:\/\//i.test(v || '') ? v : v && /^www\./i.test(v) ? `https://${v}` : null);
+
+/* Google Maps for the place. With an address, the documented search URL
+   (maps/search/?api=1&query=), which the Google Maps app on a phone opens too:
+   name and address together find the listing itself. Without one, a name alone
+   would find every restaurant of that name, so the search is pinned to where
+   OSM has the place instead, which Google Maps reads from the @lat,lon,zoom
+   part of its own search URLs. */
+function googleMapsUrl(st) {
+  const address = stopAddress(stopTags(st));
+  if (address) {
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${st.name}, ${address}`)}`;
+  }
+  return `https://www.google.com/maps/search/${encodeURIComponent(st.name)}/@${st.lat},${st.lon},18z`;
+}
+
+const stopRef = (st) => `${st.osm_type}/${st.osm_id}`;
+
+function stopCard(st, k) {
+  const t = stopTags(st);
+  const after = st.after_session >= 0 ? st.after_session + 1 : null;
+  const link = (href, text) => `<a class="road-card-link" target="_blank" rel="noopener noreferrer" href="${escapeHtml(href)}">${escapeHtml(text)}</a>`;
+  const rows = [];
+  const address = stopAddress(t);
+  if (address) rows.push(['Address', escapeHtml(address)]);
+  const seen = new Set();
+  for (const [key, label, show, href] of STOP_FACTS) {
+    const v = t[key];
+    if (!v || seen.has(label)) continue;
+    seen.add(label);
+    const text = escapeHtml(show ? show(v) : v);
+    rows.push([label, href ? `<a href="${escapeHtml(href(v))}">${text}</a>` : text]);
+  }
+  const web = httpUrl(t.website || t['contact:website'] || t.url);
+  const detour = st.detour_km > 0
+    ? `${st.detour_km} km off the route, ${humanMinutes(st.detour_min)} there and back`
+    : 'right on the route';
+  const all = Object.keys(t).sort().map((key) =>
+    `<div class="stop-tag"><span>${escapeHtml(key)}</span><span>${escapeHtml(String(t[key]))}</span></div>`).join('');
+  return '<div class="road-card stop-card">'
+    + `<div class="road-card-name">${escapeHtml(st.name)}</div>`
+    + `<div class="road-card-meta">${after ? `Break after session ${after}` : `Break ${k + 1}`} · ${escapeHtml(detour)}</div>`
+    + (rows.length ? `<dl class="stop-facts">${rows.map(([l, v]) => `<dt>${l}</dt><dd>${v}</dd>`).join('')}</dl>` : '')
+    + '<div class="stop-links">'
+    + link(googleMapsUrl(st), 'Google Maps')
+    + (web ? ` · ${link(web, 'Website')}` : '')
+    + ` · ${link(`https://www.openstreetmap.org/${stopRef(st)}`, 'OpenStreetMap')}`
+    + '</div>'
+    + `<details class="stop-all"><summary>All OSM tags (${Object.keys(t).length})</summary>${all}</details>`
+    + `<button type="button" class="ghost stop-ban" data-ref="${escapeHtml(stopRef(st))}">Ban this restaurant</button>`
+    + '</div>';
+}
+
 function drawStops(res) {
   if (state.stopLayer) { map.removeLayer(state.stopLayer); state.stopLayer = null; }
   const stops = res.stops || [];
   if (!stops.length) return;
+  // Leaflet pans a card into view against the map's edges only, and the tool
+  // bar floats over the top of the map: the card is kept clear of it too.
+  const barBottom = $('topbar').getBoundingClientRect().bottom - mapEl.getBoundingClientRect().top;
+  const clear = {
+    autoPanPaddingTopLeft: L.point(16, Math.max(barBottom, 0) + 12),
+    autoPanPaddingBottomRight: L.point(16, 16),
+  };
   state.stopLayer = L.layerGroup(stops.map((st, k) => {
-    const after = st.after_session >= 0 ? st.after_session + 1 : null;
-    const facts = [
-      st.cuisine ? st.cuisine.replace(/;/g, ', ') : null,
-      st.detour_km > 0 ? `${st.detour_km} km off the route, ${humanMinutes(st.detour_min)} there and back` : 'right on the route',
-    ].filter(Boolean);
-    const link = `https://www.openstreetmap.org/${st.osm_type}/${st.osm_id}`;
-    const html = '<div class="road-card stop-card">'
-      + `<div class="road-card-name">${escapeHtml(st.name)}</div>`
-      + `<div class="road-card-meta">${after ? `Break after session ${after}` : `Break ${k + 1}`}</div>`
-      + facts.map((f) => `<div class="stop-fact">${escapeHtml(f)}</div>`).join('')
-      + (st.opening_hours ? `<div class="stop-fact">Open: ${escapeHtml(st.opening_hours)}</div>` : '')
-      + (/^https?:\/\//i.test(st.website || '') ? `<a class="road-card-link" target="_blank" rel="noopener noreferrer" href="${escapeHtml(st.website)}">Website</a> · ` : '')
-      + `<a class="road-card-link" target="_blank" rel="noopener noreferrer" href="${link}">OpenStreetMap</a>`
-      + '</div>';
-    return L.marker([st.lat, st.lon], { icon: STOP_ICON, keyboard: true, title: st.name })
+    const marker = L.marker([st.lat, st.lon], { icon: STOP_ICON, keyboard: true, title: st.name })
       .bindTooltip(escapeHtml(st.name), { direction: 'top', offset: [0, -14] })
-      .bindPopup(html, { className: 'road-popup', maxWidth: 280 });
+      .bindPopup(stopCard(st, k), { className: 'road-popup', maxWidth: 300, minWidth: 250, ...clear });
+    // Banning answers at once, like a coverage edit: the list takes it and the
+    // route is worked out again without it, on the same piece of map.
+    marker.on('popupopen', (ev) => {
+      const button = ev.popup.getElement().querySelector('.stop-ban');
+      if (button) button.onclick = () => {
+        map.closePopup(ev.popup);
+        banPlace(stopRef(st), st.name);
+      };
+    });
+    return marker;
   })).addTo(map);
 }
 

@@ -35,6 +35,23 @@ export const PHASES = [
 
 export class RequestError extends Error {}
 
+/* Places never to stop at, as OSM refs - "node/123", "way/45" - sorted, so the
+   same list in another order is the same request. A typo guard on the count. */
+const MAX_BANNED_PLACES = 500;
+
+function parseBannedPlaces(raw) {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) throw new RequestError('the banned places are malformed');
+  const refs = new Set();
+  for (const r of raw) {
+    const ref = String(r).trim();
+    if (!/^(node|way|relation)\/\d+$/.test(ref)) throw new RequestError(`'${ref}' is not an OSM ref like node/123`);
+    refs.add(ref);
+  }
+  if (refs.size > MAX_BANNED_PLACES) throw new RequestError(`at most ${MAX_BANNED_PLACES} banned places`);
+  return [...refs].sort();
+}
+
 /* What joins one session to the next: nothing - a session simply ends where
    the length runs out - or a stop at a place of this kind. Each maps to the
    Overpass tag filter its places are fetched by. */
@@ -111,6 +128,7 @@ export function parseRequest(payload) {
     throw new RequestError(`sessions per day must be between 2 and ${config.SESSIONS_PER_DAY_MAX}`);
   }
   const returnHome = Boolean(payload.return_home ?? false);
+  const bannedPlaces = parseBannedPlaces(payload.banned_places);
   const start = payload.start || null;
   return {
     area,
@@ -127,6 +145,7 @@ export function parseRequest(payload) {
     // Only means anything with a break to put between them.
     sessionsPerDay: sessionBreak ? sessionsPerDay : null,
     returnHome,
+    bannedPlaces,
     margin: config.WAYPOINT_MARGIN,
     maxLegMetres: config.WAYPOINT_MAX_LEG_M,
     maxLegArcs: config.WAYPOINT_MAX_LEG_ARCS,
@@ -148,7 +167,7 @@ export function requestKey(req) {
     [...req.overrides].map(([w, f]) => `${w}:${f.drive}`).sort(),
     rulesKey(req.selection),
     req.bothDirections, req.passes, req.sessionSeconds, req.sessionBreak, req.sessionsPerDay,
-    req.returnHome,
+    req.returnHome, req.bannedPlaces,
     req.margin, req.maxLegMetres, req.maxLegArcs,
   ]);
 }
@@ -292,6 +311,7 @@ export async function compute(req, { progress = null, cache = null } = {}) {
       session_break: req.sessionBreak,
       sessions_per_day: req.sessionsPerDay,
       return_home: req.returnHome,
+      banned_places: req.bannedPlaces,
     },
     coverage,
     notes,
@@ -304,7 +324,7 @@ export async function compute(req, { progress = null, cache = null } = {}) {
     stops: stops.map((s, k) => ({
       name: s.place.name, lat: round6(s.place.lat), lon: round6(s.place.lon),
       osm_type: s.place.osm_type, osm_id: s.place.osm_id,
-      cuisine: s.place.cuisine, opening_hours: s.place.opening_hours, website: s.place.website,
+      tags: s.place.tags || {},
       detour_km: Math.round(s.detour_m / 10) / 100, detour_min: Math.round(s.detour_s / 6) / 10,
       snap_m: s.snap_m,
       after_session: sessions.findIndex((x) => x.stop === k),
@@ -333,6 +353,11 @@ async function planBreaks(req, g, circuit, { cache, say, homeNode = -1 }) {
     try {
       const { fetchBox } = osm.roadBoxes(req.area, fetchBufferM(req));
       places = await osm.fetchPlaces(fetchBox, BREAK_PLACES[req.sessionBreak], { cache, progress: say });
+      // The user's word against OSM's: a place they never want to stop at.
+      const banned = new Set(req.bannedPlaces);
+      const before = places.length;
+      places = places.filter((p) => !banned.has(`${p.osm_type}/${p.osm_id}`));
+      if (before > places.length) console.info(`${before - places.length} banned restaurants left out`);
     } catch (err) {
       console.warn('no places for the breaks:', err.message);
       failed = 'restaurants could not be downloaded, so the breaks are plain cuts';

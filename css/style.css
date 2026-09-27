@@ -722,7 +722,46 @@ html, body {
   fill: none; stroke: currentColor; stroke-width: 1.9;
   stroke-linecap: round; stroke-linejoin: round;
 }
-.stop-card .stop-fact { margin-top: 3px; font-size: 12px; color: var(--ink-2); }
+.stop-card { max-width: 300px; }
+.stop-facts {
+  display: grid; grid-template-columns: auto 1fr; gap: 2px 10px;
+  margin: 10px 0 0; font-size: 12px;
+}
+.stop-facts dt { color: var(--ink-3); }
+.stop-facts dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.stop-facts a { color: var(--accent); }
+.stop-links { margin-top: 8px; font-size: 12px; color: var(--ink-3); }
+.stop-links .road-card-link { margin-top: 0; font-size: 12px; color: var(--accent); }
+.stop-all { margin-top: 8px; font-size: 11.5px; color: var(--ink-3); }
+.stop-all summary { cursor: pointer; }
+.stop-all summary:hover { color: var(--ink); }
+.stop-tag {
+  display: grid; grid-template-columns: minmax(80px, 40%) 1fr; gap: 6px;
+  padding: 1px 0;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.stop-tag span:first-child { color: var(--ink-3); overflow-wrap: anywhere; }
+.stop-tag span:last-child { color: var(--ink-2); overflow-wrap: anywhere; }
+.stop-all[open] { max-height: 200px; overflow-y: auto; }
+.stop-ban { display: block; width: 100%; margin-top: 10px; }
+.stop-ban:hover { color: var(--bad); border-color: var(--bad-line); background: var(--bad-soft); }
+
+/* The banned list in the panel: one line per restaurant, a link to it in OSM
+   and the cross that allows it again. */
+.banned-list { margin: 0 0 6px; padding: 0; list-style: none; }
+.banned-list:empty { display: none; }
+.banned-list li {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 4px 3px 8px; margin-bottom: 3px;
+  font-size: 12.5px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.banned-list a { flex: 1 1 auto; min-width: 0; color: var(--ink); text-decoration: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.banned-list a:hover { color: var(--accent); }
+.banned-form { display: flex; gap: 6px; }
+.banned-form input { flex: 1 1 auto; min-width: 0; }
+.banned-form .ghost { flex: 0 0 auto; }
 /* Wraps rather than ellipses: the share at its end is the figure most worth
    reading, and the list is too narrow for the whole line on one row. */
 /* What the compute had to settle for - a break with no restaurant, home far

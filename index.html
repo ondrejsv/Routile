@@ -145,6 +145,21 @@
               viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="M12 2.5a9.5 9.5 0 1 0 0 19 9.5 9.5 0 1 0 0-19zM12 6.9a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 1 0 0-2.6zM10.85 12.35a1.15 1.15 0 0 1 2.3 0v3.5a1.15 1.15 0 0 1-2.3 0z"/></svg></button></span>
         <input type="number" id="sessions-per-day" value="2" min="2" step="1" inputmode="numeric">
       </label>
+
+      <!-- Restaurants never to stop at, by OSM ref. Filled from a stop's card
+           on the map, or by hand; see the banned list in app.js. -->
+      <div class="field hidden" id="banned-field">
+        <span>Banned restaurants<button type="button" class="info"
+              aria-label="How to ban a restaurant"
+              data-tip="Restaurants the breaks never stop at. Click a restaurant on the map and choose Ban, or type its OpenStreetMap id or link here - node/123, n123 or the openstreetmap.org address."><svg
+              viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="M12 2.5a9.5 9.5 0 1 0 0 19 9.5 9.5 0 1 0 0-19zM12 6.9a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 1 0 0-2.6zM10.85 12.35a1.15 1.15 0 0 1 2.3 0v3.5a1.15 1.15 0 0 1-2.3 0z"/></svg></button></span>
+        <ul id="banned-list" class="banned-list"></ul>
+        <form id="banned-form" class="banned-form" autocomplete="off">
+          <input type="text" id="banned-input" placeholder="node/123 or an openstreetmap.org link">
+          <button type="submit" class="ghost">Ban</button>
+        </form>
+        <p class="rule-error" id="banned-error"></p>
+      </div>
     </section>
 
     <!-- Which roads in the zones must be driven. Rows are built by the rules
